@@ -17,6 +17,10 @@ jobs:
       - run: python -m pytest tests/ -v
 
   eval-gate:
+    # Depends on the fast guardrail tests passing first — no point spending
+    # 5-10 minutes pulling a model and running eval if a cheap, fast check
+    # already caught a regression. "Fail fast" ordering.
+    needs: guardrail-unit-tests
     # Full RAG pipeline eval: spins up Qdrant + Ollama, ingests the sample
     # docs, and runs eval/run_eval.py as a merge gate.
     #
@@ -27,6 +31,7 @@ jobs:
     # spinning up a fresh model per CI run. This job is kept here to show
     # the *pattern* end-to-end; production would swap the local Ollama
     # service below for the shared platform endpoint.
+    
     runs-on: ubuntu-latest
     services:
       qdrant:
@@ -48,6 +53,12 @@ jobs:
           ollama pull llama3.2:3b
 
       - name: Start LiteLLM gateway
+        # OLLAMA_API_BASE=localhost here (not the "ollama" hostname used in
+        # docker-compose.yml) because in this CI job Ollama runs as a plain
+        # process on the runner, not as a Docker Compose service — there's
+        # no container DNS name to resolve.
+        env:
+          OLLAMA_API_BASE: http://localhost:11434
         run: |
           pip install 'litellm[proxy]'
           litellm --config litellm_config.yaml --port 4000 &

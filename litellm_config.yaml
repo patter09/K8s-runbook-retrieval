@@ -2,7 +2,7 @@ model_list:
   - model_name: knowledge-assistant
     litellm_params:
       model: ollama/llama3.2:3b
-      api_base: http://ollama:11434
+      api_base: os.environ/OLLAMA_API_BASE
 
 # Per-team virtual keys go here in a real deployment, e.g.:
 # litellm_settings:
