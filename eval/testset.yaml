@@ -1,0 +1,28 @@
+# Each question should be answerable from data/sample_docs.
+# expected_keywords: terms that MUST appear (case-insensitive) in a correct,
+# grounded answer. This is a stand-in for a full RAGAS/LLM-judge evaluation —
+# see README for why that trade-off was made.
+
+- question: "What are all the things I should check when an AKS pod is stuck in CrashLoopBackOff?"
+  expected_keywords:
+    - "describe"
+    - "logs"
+    - "oomkilled"
+
+- question: "How do I resolve a stuck Terraform state lock?"
+  expected_keywords:
+    - "force-unlock"
+    - "lock id"
+
+- question: "Why might an ArgoCD application stay OutOfSync after a sync?"
+  expected_keywords:
+    - "presync"
+    - "drift"
+
+- question: "What is the capital of France?"
+  expected_keywords: []
+  expect_no_answer: true
+  note: >
+    Not covered by any runbook. The assistant should say it doesn't have
+    enough information rather than hallucinating an answer. This tests
+    groundedness, not just keyword coverage.

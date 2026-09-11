@@ -1,0 +1,18 @@
+model_list:
+  - model_name: knowledge-assistant
+    litellm_params:
+      model: ollama/llama3.2:3b
+      api_base: http://ollama:11434
+
+# Per-team virtual keys go here in a real deployment, e.g.:
+# litellm_settings:
+#   virtual_keys:
+#     - key: sk-team-platform-eng
+#       models: ["knowledge-assistant"]
+#       rpm_limit: 60
+#
+# For this local demo we use a single master key (see LITELLM_MASTER_KEY in
+# docker-compose.yml) and note per-team keys as the production next step.
+
+general_settings:
+  master_key: sk-local-dev-key

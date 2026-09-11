@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  guardrail-unit-tests:
+    # Fast, deterministic checks — no LLM/model dependency, runs on every push.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: python -m pytest tests/ -v
+
+  eval-gate:
+    # Full RAG pipeline eval: spins up Qdrant + Ollama, ingests the sample
+    # docs, and runs eval/run_eval.py as a merge gate.
+    #
+    # NOTE (talking point for the interview): pulling and running an LLM in
+    # a GitHub-hosted runner is slow and resource-constrained. A real
+    # deployment points this job at a shared, already-warm model endpoint
+    # (the same LiteLLM gateway the app uses in production) instead of
+    # spinning up a fresh model per CI run. This job is kept here to show
+    # the *pattern* end-to-end; production would swap the local Ollama
+    # service below for the shared platform endpoint.
+    runs-on: ubuntu-latest
+    services:
+      qdrant:
+        image: qdrant/qdrant:latest
+        ports:
+          - 6333:6333
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+
+      - name: Install and start Ollama
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          ollama serve &
+          sleep 5
+          ollama pull llama3.2:3b
+
+      - name: Start LiteLLM gateway
+        run: |
+          pip install 'litellm[proxy]'
+          litellm --config litellm_config.yaml --port 4000 &
+          sleep 5
+
+      - name: Ingest sample docs
+        run: python app/ingest.py data/sample_docs
+
+      - name: Run eval gate
+        run: python eval/run_eval.py --threshold 0.75
