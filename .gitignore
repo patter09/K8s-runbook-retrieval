@@ -3,3 +3,16 @@ __pycache__/
 *.pyc
 .env
 .pytest_cache/
+
+# Terraform: state and generated kubeconfig contain real credentials
+# (client certs/keys) and must never be committed, even for a throwaway
+# local cluster — this is the correct habit regardless of what the
+# credentials point to. The .terraform.lock.hcl file is DIFFERENT — it's
+# just a provider version pin (like requirements.txt) and SHOULD be
+# committed, so it's deliberately not listed here.
+infra/terraform/.terraform/
+infra/terraform/*.tfstate
+infra/terraform/*.tfstate.*
+infra/terraform/*.tfvars
+infra/terraform/devops-ai-platform-config
+infra/terraform/kubeconfig*
