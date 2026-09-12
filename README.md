@@ -41,6 +41,22 @@ which one, so you can talk through the mapping in an interview.
   eval/run_eval.py runs in CI on every change (grounding/faithfulness gate)
 ```
 
+**Deployment targets — both run the identical stack, unmodified app code:**
+
+- **Kubernetes (primary)** — a local `kind` cluster, provisioned by Terraform
+  (`infra/terraform/`), running all 6 services as proper Deployments/Services
+  (`k8s/`). This is the one that actually maps to the JD's "cloud-native
+  infra, Kubernetes, IaC" requirements, and the one worth demoing.
+- **Docker Compose (local dev)** — the original, simpler setup
+  (`docker-compose.yml`), kept because it's faster to spin up for quick
+  local iteration and because the debugging log below captures real,
+  transferable lessons (dependency pinning, non-determinism, CI environment
+  differences) that aren't specific to either deployment target.
+
+Both were verified to produce **identical eval-gate results (4/4 pass)** —
+this isn't an assumption, it was actually tested by running the same
+`eval/run_eval.py` suite against both environments.
+
 ## Why each piece is here (map to platform-engineering requirements)
 
 | Component | JD-style requirement it demonstrates |
@@ -51,9 +67,63 @@ which one, so you can talk through the mapping in an interview.
 | `eval/run_eval.py` + GitHub Actions | MLOps/LLMOps CI/CD, model/prompt lifecycle management |
 | Prometheus + Grafana | Observability, platform reliability |
 | `guardrails.py` | Responsible AI, governance, auditability |
-| Docker Compose (→ later: Helm/Terraform) | Cloud-native infra, IaC, Kubernetes |
+| `infra/terraform/` + `k8s/` | Cloud-native infra, IaC, Kubernetes |
 
-## Quick start
+## Running on Kubernetes (primary path)
+
+```bash
+# 1. Provision the local cluster
+cd infra/terraform
+terraform init
+terraform apply
+
+# 2. Point kubectl at it (path comes from the apply output)
+export KUBECONFIG=$(terraform output -raw kubeconfig_path)
+kubectl get nodes   # should show one Ready node
+
+# 3. Build the app image and load it into the cluster
+cd ..
+docker build -t knowledge-assistant:local .
+kind load docker-image knowledge-assistant:local --name devops-ai-platform
+
+# 4. Deploy everything
+kubectl apply -f k8s/qdrant.yaml
+kubectl apply -f k8s/ollama.yaml
+kubectl apply -f k8s/litellm.yaml
+kubectl apply -f k8s/knowledge-assistant.yaml
+kubectl apply -f k8s/prometheus.yaml
+kubectl apply -f k8s/grafana.yaml
+kubectl get pods   # wait for all to show 1/1 Running
+
+# 5. Pull the model into the (fresh, unpersisted) Ollama pod
+kubectl exec -it deployment/ollama -- ollama pull llama3.2:3b
+
+# 6. Ingest sample docs (port-forward Qdrant so your host's ingest.py can reach it)
+kubectl port-forward svc/qdrant 6333:6333 &
+QDRANT_URL=http://localhost:6333 python app/ingest.py data/sample_docs
+```
+
+Then query it directly — **no port-forward needed** for the app itself,
+because `k8s/knowledge-assistant.yaml` uses a `NodePort` Service mapped to
+host port 8000 via the `extra_port_mappings` in `infra/terraform/main.tf`:
+
+```bash
+curl -X POST http://localhost:8000/query -H "Content-Type: application/json" \
+  -d '{"question": "What are all the things I should check when an AKS pod is stuck in CrashLoopBackOff?"}'
+```
+
+Prometheus (`localhost:9090`) and Grafana (`localhost:3000`) are reachable
+the same way — same NodePort pattern, no port-forwarding required. Grafana
+setup is identical to the Compose version below, except the Prometheus data
+source URL is still `http://prometheus:9090` — same value, but now resolved
+via Kubernetes' own Service DNS rather than Docker Compose's.
+
+**Known simplification:** Ollama has no PersistentVolume yet, so a pod
+restart wipes the pulled model and step 5 needs re-running. A production
+setup would mount a PersistentVolumeClaim, the Kubernetes equivalent of the
+`ollama_data` named volume in `docker-compose.yml`.
+
+## Running on Docker Compose (local dev alternative)
 
 ```bash
 cp .env.example .env
@@ -78,7 +148,8 @@ uvicorn main:app --reload --port 8000 --host 0.0.0.0
 **Linux only:** if you have `ufw` (or another firewall) active, it will likely
 block Prometheus's container from reaching the host on port 8000 by default.
 See "Issue 5" in the debugging log below for the correctly-scoped fix
-(don't just disable the firewall).
+(don't just disable the firewall). Note this problem is specific to Compose
+— see "Issue 6" for why it doesn't occur on Kubernetes.
 
 Then:
 ```bash
@@ -121,10 +192,15 @@ DevOps-background candidates skip, and it's worth walking through explicitly.
 - Guardrails are regex-based PII/prompt-injection checks, not a full
   NeMo Guardrails setup — same reasoning: demonstrates the governance
   *pattern* that an enterprise platform needs, cheaply and explainably.
-- Runs on Docker Compose, not Kubernetes yet. That's the next phase: the same
-  services move into Helm charts on a local `kind` cluster, provisioned by
-  Terraform — which is where your existing AKS/EKS/Terraform experience plugs
-  in directly. Say so in the interview: this repo is phase 1 of that plan.
+- The Kubernetes manifests in `k8s/` are plain YAML, not Helm charts —
+  enough to demonstrate the Deployment/Service/ConfigMap pattern correctly,
+  but a real platform would template these with Helm (or Kustomize) for
+  reuse across environments. Also, `infra/terraform/` currently only
+  provisions the *cluster*; a further step would have Terraform apply the
+  `k8s/` manifests too (via the `kubernetes` or `helm` Terraform provider)
+  instead of running `kubectl apply` by hand.
+- Ollama has no PersistentVolume on Kubernetes yet (see the Kubernetes
+  section above) — a named-volume equivalent for model weights.
 
 ## Debugging log — what actually broke, and how it was fixed
 
@@ -264,6 +340,43 @@ narrowly instead of disabling the firewall, is a more realistic and more
 convincing demonstration of network troubleshooting than if it had worked
 on the first try.
 
+### Issue 6 — `kind` cluster failed to create: port conflict with the running Compose stack
+
+**Symptom:** `terraform apply` failed with `docker run ... failed with error:
+exit status 125` when creating the `kind` cluster's node container.
+
+**Root cause:** the Terraform config maps host ports 8000, 9090, and 3000
+into the cluster (for the app, Prometheus, and Grafana respectively) — but
+the Docker Compose stack was still running at the time, with `prometheus`
+bound to 9090 and `grafana` bound to 3000. Two different container
+runtimes both trying to claim the same host ports.
+
+**Fix:** `docker compose down` before creating the `kind` cluster. This
+also reflects the right mental model going forward: Compose and Kubernetes
+are two alternative deployment targets for the same stack, not meant to run
+simultaneously on the same ports.
+
+### Issue 7 — Kubernetes app pod stuck in `ImagePullBackOff`
+
+**Symptom:** (avoided, but worth documenting as a known `kind`-specific
+gotcha) — deploying a locally-built image to a `kind` cluster without
+`imagePullPolicy: Never` causes Kubernetes to try pulling the image from
+Docker Hub by default, which fails since the image only exists locally.
+
+**Root cause:** `kind load docker-image` copies an image directly into the
+node's local image store — it does not register the image with any
+registry. Kubernetes' default `imagePullPolicy` (`IfNotPresent` for tagged
+images, `Always` for `:latest`) can still attempt a registry pull under
+some conditions, and this is a well-known point of confusion specifically
+with `kind` (a real cloud cluster wouldn't have this issue, since it always
+pulls from a real registry like ACR/ECR).
+
+**Fix:** set `imagePullPolicy: Never` explicitly in
+`k8s/knowledge-assistant.yaml`, telling Kubernetes to only use what's
+already on the node. Worth naming explicitly in an interview as a
+`kind`-specific detail that wouldn't apply on AKS/EKS, where the equivalent
+step is pushing to a real registry instead.
+
 ## Interview talking points
 
 - "I built the AI-specific layer (vector search, model serving, gateway) the
@@ -273,9 +386,14 @@ on the first try.
   changes specifically (non-deterministic output means "tests pass" isn't
   enough — you need to gate on answer quality/grounding).
 - Be upfront about what's simplified and what the production version would
-  add (RAGAS, NeMo Guardrails, Kubernetes/Helm, a real model registry via
-  MLflow) — this signals platform-engineering judgment, not just tool usage.
+  add (RAGAS, NeMo Guardrails, Helm/Kustomize, a real model registry via
+  MLflow, Terraform-managed Helm releases) — this signals platform-engineering
+  judgment, not just tool usage.
 - The debugging log above is the most concrete evidence of hands-on
   troubleshooting in this repo — the network/firewall issue (Issue 5) in
   particular is a good default answer to "tell me about a time you debugged
-  a tricky infrastructure problem."
+  a tricky infrastructure problem," and Issues 6-7 are good, specific
+  answers to "what's different about running this on Kubernetes vs. Compose."
+- Both deployment targets were verified to produce identical eval-gate
+  results (4/4 pass) — a concrete way to say "I proved the migration was
+  correct" instead of just "I migrated it."
