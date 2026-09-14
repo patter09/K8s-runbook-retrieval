@@ -200,7 +200,24 @@ DevOps-background candidates skip, and it's worth walking through explicitly.
   `k8s/` manifests too (via the `kubernetes` or `helm` Terraform provider)
   instead of running `kubectl apply` by hand.
 - Ollama has no PersistentVolume on Kubernetes yet (see the Kubernetes
-  section above) — a named-volume equivalent for model weights.
+  section above) — a named-volume equivalent for model weights. **Update:**
+  this stopped being a hypothetical gap — a Qdrant pod restart during the
+  security work wiped its data and an Ollama restart wiped its pulled
+  model, both in the same session, requiring re-ingestion and re-pulling.
+  Real, recurring evidence this is a genuine next step, not a nice-to-have.
+- **Security is deliberately partial, not absent.** Implemented so far:
+  secret scanning (`gitleaks`, default + custom rules, CI-gated — see
+  Issue 8), no hardcoded credentials (env-var references and Kubernetes
+  `Secret` objects via `secretKeyRef` throughout), and the existing
+  `guardrails.py` input/output filtering. **Not yet implemented**, and
+  worth naming explicitly rather than glossing over: container image
+  vulnerability scanning (Trivy), static analysis on `app/*.py` (SAST, e.g.
+  SonarCloud), dynamic scanning of the running API (DAST, e.g. OWASP ZAP),
+  Kubernetes RBAC scoping each pod to least privilege, Kyverno policies
+  (e.g. enforcing non-root containers), and any authentication at all on
+  the `/query` endpoint. Given the CV skills this project maps against
+  (SAST, DAST, Trivy, RBAC, defense-in-depth), this is the most valuable
+  remaining phase, not an afterthought.
 
 ## Debugging log — what actually broke, and how it was fixed
 
@@ -377,6 +394,91 @@ already on the node. Worth naming explicitly in an interview as a
 `kind`-specific detail that wouldn't apply on AKS/EKS, where the equivalent
 step is pushing to a real registry instead.
 
+### Issue 8 — a real hardcoded secret, and five compounding problems in fixing it properly
+
+**Symptom:** while doing a security pass mapped against SAST/DAST/secrets-
+management practices, manual inspection found `LITELLM_MASTER_KEY` /
+`LITELLM_API_KEY` hardcoded as the literal string `sk-local-dev-key` across
+`docker-compose.yml`, `litellm_config.yaml`, `k8s/litellm.yaml`,
+`k8s/knowledge-assistant.yaml`, and `.env.example` — all committed to a
+public GitHub repo. This is a real, valuable finding by itself, but fixing
+it *properly* surfaced five further, genuinely instructive problems.
+
+**1. Off-the-shelf secret scanning missed it entirely.** Running
+`gitleaks` (a standard open-source secret scanner) against the repo
+reported "no leaks found." Verified this wasn't a broken tool by testing a
+known AWS-format example key (`AKIAIOSFODNN7EXAMPLE`) in parallel — that
+one WAS caught. Conclusion: pattern/entropy-based scanners are built to
+catch known credential formats and high-entropy (random-looking) strings;
+a short, human-readable, low-entropy placeholder like `sk-local-dev-key`
+defeats both signals. **Fix:** wrote a custom `gitleaks` rule matching on
+variable-name *context* (`api_key`, `master_key`, `password`, etc.
+assigned to any string) rather than the value's randomness.
+
+**2. The custom rule then over-matched its own fix.** After moving secrets
+to `os.environ/...` references (the correct fix), the custom rule flagged
+those safe reference strings too (`master_key: os.environ/LITELLM_MASTER_KEY`
+matched just as "looking like" a secret assignment). **Root cause:** Go's
+regex engine (which `gitleaks` uses) doesn't support lookahead assertions,
+so "match this shape but not that one" can't be expressed directly.
+**Fix:** narrowed the value character class to exclude `.`, since
+`os.environ`/`os.getenv` both contain a dot early enough to fall below the
+rule's 6-character minimum once the dot stops the match — a workaround
+that exploits the specific shape of the safe pattern rather than needing
+lookahead. One residual false positive (`api_key=LITELLM_API_KEY`, a
+variable reference with no dot) couldn't be resolved by regex alone and
+was handled via baseline instead — a deliberate, documented trade-off, not
+an oversight.
+
+**3. The baseline was built backwards on the first attempt.** A baseline
+suppresses reviewed findings so they don't re-trigger on every future scan
+(avoiding alert fatigue). The first version baselined the 4 real secrets
+but *excluded* 2 known false positives — meaning the false positives would
+have re-flagged forever, the opposite of what a baseline is for. **Fix:**
+baseline should hold everything already reviewed, real or not.
+
+**4. Hand-editing the baseline broke its own suppression mechanism.**
+Attempted to redact the literal secret text from the baseline JSON
+(reasoning: the report file itself was recommitting the old plaintext
+secret on every edit — a real, separate finding). This was based on an
+assumption that `gitleaks` matches baseline entries by `Fingerprint` alone.
+That assumption was wrong for this version: a side-by-side test (identical
+findings, one hand-edited copy vs. one untouched tool-generated copy)
+showed the edited version stopped suppressing anything, while the
+untouched one worked perfectly. **Fix:** never hand-edit a baseline file;
+instead added a path-based `[allowlist]` entry excluding the baseline file
+itself from being scanned at all — solving the self-leak problem without
+touching tool-generated output.
+
+**5. A file named `.gitleaks.toml` is silently auto-loaded on every
+invocation, replacing default rules.** Discovered that running
+`gitleaks detect` with **no** `--config` flag at all still picked up the
+custom-only rule set, because `gitleaks` auto-discovers `.gitleaks.toml`
+in the scan root. Since the custom config had no working `[extends]`,
+this meant default AWS-key/GitHub-token/entropy detection was silently
+disabled for the whole repo. Two attempted fixes —
+`[extends] path = "..."` (no such file exists on disk; defaults are
+compiled into the binary) and `[extends] useDefault = true` (accepted
+without error, but verified via direct testing to not actually merge
+default rules in this gitleaks version, 8.16.0) — both failed. **Robust
+fix:** renamed the file to `.gitleaks-custom.toml`, deliberately outside
+gitleaks' auto-discovery convention, and now run two explicit, independent
+scans — `gitleaks detect --source .` (real, untouched defaults) and
+`gitleaks detect --config .gitleaks-custom.toml --baseline-path ...` (the
+custom rule) — verified separately, each confirmed working in isolation.
+
+**Also caught before it caused a silent gap:** `actions/checkout` defaults
+to a shallow clone (`fetch-depth: 1`, latest commit only). Since `gitleaks`
+scans git *history*, a shallow clone would have made the CI job blind to
+almost everything this issue is about — fixed with `fetch-depth: 0`.
+
+**Why this whole arc is worth walking through in an interview, not just
+summarizing:** every "fix" here was tested and several were found to be
+wrong on the first attempt — the entropy assumption, the baseline
+direction, the fingerprint-matching claim, two different `[extends]`
+attempts. That's a more honest and more convincing demonstration of
+security engineering than a clean one-shot fix would have been.
+
 ## Interview talking points
 
 - "I built the AI-specific layer (vector search, model serving, gateway) the
@@ -397,3 +499,9 @@ step is pushing to a real registry instead.
 - Both deployment targets were verified to produce identical eval-gate
   results (4/4 pass) — a concrete way to say "I proved the migration was
   correct" instead of just "I migrated it."
+- Issue 8 (secrets/secret-scanning) is the strongest security story in the
+  repo: a real finding, a genuinely nuanced tool limitation (entropy-based
+  scanning missing low-entropy secrets), a hard engine constraint (no
+  regex lookahead in Go/RE2), and two of my own assumptions proven wrong by
+  direct testing before landing on the robust fix. Good default answer to
+  "tell me about a security issue you found and fixed yourself."
