@@ -1,3 +1,8 @@
+# ConfigMap holds the litellm_config.yaml content as cluster-stored data.
+# It gets mounted into the pod as an actual file at runtime — this is the
+# Kubernetes-native replacement for docker-compose.yml's simple bind mount
+# (`./litellm_config.yaml:/app/config.yaml`), since a pod has no access to
+# your local filesystem.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -11,7 +16,10 @@ data:
           api_base: os.environ/OLLAMA_API_BASE
 
     general_settings:
-      master_key: sk-local-dev-key
+      # Same os.environ/ reference pattern as api_base above — the actual
+      # value comes from the LITELLM_MASTER_KEY env var (set below via
+      # secretKeyRef), never written literally in this ConfigMap.
+      master_key: os.environ/LITELLM_MASTER_KEY
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -37,7 +45,15 @@ spec:
             - containerPort: 4000
           env:
             - name: LITELLM_MASTER_KEY
-              value: "sk-local-dev-key"
+              # secretKeyRef pulls this value from the litellm-credentials
+              # Secret (created imperatively via `kubectl create secret`,
+              # never written into any YAML file) instead of a literal
+              # "value:" field. This manifest is now safe to commit — it
+              # references a secret by name, it doesn't contain one.
+              valueFrom:
+                secretKeyRef:
+                  name: litellm-credentials
+                  key: api-key
             - name: OLLAMA_API_BASE
               value: "http://ollama:11434"
           volumeMounts:

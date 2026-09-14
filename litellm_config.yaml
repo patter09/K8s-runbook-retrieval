@@ -15,4 +15,4 @@ model_list:
 # docker-compose.yml) and note per-team keys as the production next step.
 
 general_settings:
-  master_key: sk-local-dev-key
+  master_key: os.environ/LITELLM_MASTER_KEY

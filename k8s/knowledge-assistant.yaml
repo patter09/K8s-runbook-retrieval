@@ -17,16 +17,30 @@ spec:
       containers:
         - name: knowledge-assistant
           image: knowledge-assistant:local
+          # Critical: this image was loaded directly into the kind node via
+          # `kind load docker-image`, not pushed to a registry. Without this,
+          # Kubernetes' default behavior is to try PULLING the image from
+          # Docker Hub, fail (no such public image), and the pod gets stuck
+          # in ImagePullBackOff. imagePullPolicy: Never tells it "only use
+          # what's already on the node" — correct for this local demo, but
+          # a real deployment would use a registry image + Always/IfNotPresent.
           imagePullPolicy: Never
           ports:
             - containerPort: 8000
           env:
+            # These override config.py's localhost defaults with the
+            # Kubernetes Service DNS names created by qdrant.yaml and
+            # litellm.yaml — same env-var-driven pattern used throughout
+            # this project (see the CI and LiteLLM OLLAMA_API_BASE fixes).
             - name: QDRANT_URL
               value: "http://qdrant:6333"
             - name: LITELLM_BASE_URL
               value: "http://litellm:4000"
             - name: LITELLM_API_KEY
-              value: "sk-local-dev-key"
+              valueFrom:
+                secretKeyRef:
+                  name: litellm-credentials
+                  key: api-key
             - name: LLM_MODEL_NAME
               value: "knowledge-assistant"
           readinessProbe:
@@ -47,4 +61,8 @@ spec:
     - port: 8000
       targetPort: 8000
       nodePort: 30080
+  # NodePort (not ClusterIP) because this Service needs to be reachable
+  # from OUTSIDE the cluster, on the host machine — this is the app the
+  # user actually queries. 30080 matches the extra_port_mappings entry in
+  # infra/terraform/main.tf that maps host port 8000 -> node port 30080.
   type: NodePort
