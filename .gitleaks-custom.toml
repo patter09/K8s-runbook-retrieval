@@ -1,0 +1,31 @@
+title = "custom gitleaks config — run as a SEPARATE scan alongside gitleaks' built-in defaults, not merged"
+
+# LESSON (kept deliberately, not just fixed silently): this file is named
+# .gitleaks-custom.toml, NOT .gitleaks.toml, on purpose. gitleaks
+# auto-discovers a file literally named .gitleaks.toml in the repo root on
+# EVERY invocation, even with no --config flag — confirmed by testing.
+# That auto-loaded config REPLACES the built-in default rules unless it
+# explicitly extends them. Two attempted fixes for that failed in this
+# gitleaks version (8.16.0, Ubuntu 24.04 apt package):
+#   1. [extends] path = "..." — no default config file exists anywhere on
+#      disk to point at (confirmed via `find / -name gitleaks.toml`);
+#      defaults are compiled into the binary, not shipped as a loose file.
+#   2. [extends] useDefault = true — accepted without error, but verified
+#      NOT to actually merge default rules (tested directly: a known
+#      AWS-format test string was NOT caught when this file was named
+#      .gitleaks.toml with useDefault = true, but WAS caught once this
+#      file was renamed away and gitleaks fell back to its real,
+#      unmodified embedded defaults).
+# Robust fix: keep this file OUT of the auto-discovered filename, and run
+# it as an explicit, separate `--config .gitleaks-custom.toml` scan:
+#   gitleaks detect --source . --verbose                         (real built-in defaults)
+#   gitleaks detect --source . --config .gitleaks-custom.toml --baseline-path .gitleaks-baseline.json --verbose   (this rule)
+
+[[rules]]
+id = "generic-secret-assignment"
+description = "Catches any value assigned to a common secret/key/token/password variable name, regardless of entropy. Deliberately excludes '.' from the value charset so os.environ/... and os.getenv(...) reference patterns don't match (they stop at the first '.', falling below the 6-char minimum) — those are safe indirection, not literal secrets."
+regex = '''(?i)(api[_-]?key|secret[_-]?key|master[_-]?key|access[_-]?token|password)\s*[:=]\s*["']?[A-Za-z0-9_\-]{6,}["']?'''
+tags = ["custom", "generic-secret", "low-entropy"]
+
+[allowlist]
+paths = ['''\.gitleaks-baseline\.json''']

@@ -1,7 +1,0 @@
-title = "custom gitleaks config — supplementary, run alongside gitleaks' built-in defaults"
-
-[[rules]]
-id = "generic-secret-assignment"
-description = "Catches any value assigned to a common secret/key/token/password variable name, regardless of entropy"
-regex = '''(?i)(api[_-]?key|secret[_-]?key|master[_-]?key|access[_-]?token|password)\s*[:=]\s*["']?[A-Za-z0-9._\-]{6,}["']?'''
-tags = ["custom", "generic-secret", "low-entropy"]
