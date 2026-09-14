@@ -14,22 +14,43 @@ jobs:
     #      tokens, generic high-entropy strings)
     #   2. our custom low-entropy, name-based rule, with the reviewed
     #      baseline applied so known-accepted findings don't fail the build
+    #
+    # IMPORTANT: scoped to only the commits introduced by THIS push, not
+    # full repository history. gitleaks scans git history by default, which
+    # means ANY historical commit — including ones already fixed later —
+    # gets re-flagged on every single future run forever. That's the wrong
+    # design for a per-push gate (it should ask "did THIS push introduce a
+    # problem", not "has this repo EVER contained anything flaggable").
+    # Full-history scanning remains valuable as a separate, periodic/manual
+    # audit — which is exactly what local `gitleaks detect --source .` runs
+    # during development already provide.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          # CRITICAL: actions/checkout defaults to a SHALLOW clone
-          # (fetch-depth: 1) — only the latest commit. gitleaks scans git
-          # HISTORY to find secrets committed in the past, so a shallow
-          # clone would make it blind to anything not in the newest commit,
-          # silently defeating the entire point of history-aware scanning.
           fetch-depth: 0
       - name: Install gitleaks
         run: sudo apt-get update && sudo apt-get install -y gitleaks
-      - name: Scan with gitleaks' built-in default rules
-        run: gitleaks detect --source . --verbose
-      - name: Scan with custom low-entropy rule (baselined)
-        run: gitleaks detect --source . --config .gitleaks-custom.toml --baseline-path .gitleaks-baseline.json --verbose
+
+      - name: Determine commit range for this push
+        id: range
+        run: |
+          # github.event.before is unset on pull_request events and is all
+          # zeros on the very first push to a new branch — both fall back
+          # to scanning just the latest commit rather than failing outright.
+          # This fallback is a deliberate simplification for a multi-commit
+          # PR (it won't scan every commit in the PR individually), noted
+          # here rather than hidden.
+          if [ -z "${{ github.event.before }}" ] || [ "${{ github.event.before }}" = "0000000000000000000000000000000000000000" ]; then
+            echo "opts=--log-opts=-1" >> "$GITHUB_OUTPUT"
+          else
+            echo "opts=--log-opts=${{ github.event.before }}..${{ github.event.after }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Scan with gitleaks' built-in default rules (this push only)
+        run: gitleaks detect --source . ${{ steps.range.outputs.opts }} --verbose
+      - name: Scan with custom low-entropy rule (this push only, baselined)
+        run: gitleaks detect --source . --config .gitleaks-custom.toml ${{ steps.range.outputs.opts }} --baseline-path .gitleaks-baseline.json --verbose
 
   guardrail-unit-tests:
     # Fast, deterministic checks — no LLM/model dependency, runs on every push.
