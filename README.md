@@ -407,9 +407,7 @@ it *properly* surfaced five further, genuinely instructive problems.
 **1. Off-the-shelf secret scanning missed it entirely.** Running
 `gitleaks` (a standard open-source secret scanner) against the repo
 reported "no leaks found." Verified this wasn't a broken tool by testing a
-known AWS-format example key (`AKIAIOSFODNN7EXAMPLE`) in parallel — that
-one WAS caught. Conclusion: pattern/entropy-based scanners are built to
-catch known credential formats and high-entropy (random-looking) strings;
+known AWS-format example key (the standard 20-character `AKIA...` placeholder AWS itself uses across its public documentation) in parallel — that one WAS caught. Conclusion: pattern/entropy-based scanners are built to catch known credential formats and high-entropy (random-looking) strings;
 a short, human-readable, low-entropy placeholder like `sk-local-dev-key`
 defeats both signals. **Fix:** wrote a custom `gitleaks` rule matching on
 variable-name *context* (`api_key`, `master_key`, `password`, etc.
