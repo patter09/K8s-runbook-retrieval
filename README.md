@@ -206,18 +206,22 @@ DevOps-background candidates skip, and it's worth walking through explicitly.
   model, both in the same session, requiring re-ingestion and re-pulling.
   Real, recurring evidence this is a genuine next step, not a nice-to-have.
 - **Security is deliberately partial, not absent.** Implemented so far:
-  secret scanning (`gitleaks`, default + custom rules, CI-gated — see
-  Issue 8), no hardcoded credentials (env-var references and Kubernetes
-  `Secret` objects via `secretKeyRef` throughout), and the existing
-  `guardrails.py` input/output filtering. **Not yet implemented**, and
-  worth naming explicitly rather than glossing over: container image
-  vulnerability scanning (Trivy), static analysis on `app/*.py` (SAST, e.g.
+  secret scanning (`gitleaks`, default + custom rules, CI-gated, correctly
+  scoped to per-push commits — see Issues 8-9), image vulnerability
+  scanning (Trivy — see Issue 10, OS layer patched, Python-layer CVEs
+  bumped, unfixed/vendored findings named honestly rather than hidden), no
+  hardcoded credentials anywhere (env-var references, Kubernetes `Secret`
+  objects via `secretKeyRef`, a real GitHub Actions repository secret for
+  CI — see Issue 11), and the existing `guardrails.py` input/output
+  filtering. **Not yet implemented**, and worth naming explicitly rather
+  than glossing over: static analysis on `app/*.py` (SAST, e.g.
   SonarCloud), dynamic scanning of the running API (DAST, e.g. OWASP ZAP),
   Kubernetes RBAC scoping each pod to least privilege, Kyverno policies
   (e.g. enforcing non-root containers), and any authentication at all on
-  the `/query` endpoint. Given the CV skills this project maps against
-  (SAST, DAST, Trivy, RBAC, defense-in-depth), this is the most valuable
-  remaining phase, not an afterthought.
+  the `/query` endpoint itself (as opposed to the LiteLLM gateway behind
+  it, which now genuinely enforces a master key — see Issue 11). Given the
+  CV skills this project maps against (SAST, DAST, RBAC, defense-in-depth),
+  this is the most valuable remaining phase, not an afterthought.
 
 ## Debugging log — what actually broke, and how it was fixed
 
@@ -407,7 +411,9 @@ it *properly* surfaced five further, genuinely instructive problems.
 **1. Off-the-shelf secret scanning missed it entirely.** Running
 `gitleaks` (a standard open-source secret scanner) against the repo
 reported "no leaks found." Verified this wasn't a broken tool by testing a
-known AWS-format example key (the standard 20-character `AKIA...` placeholder AWS itself uses across its public documentation) in parallel — that one WAS caught. Conclusion: pattern/entropy-based scanners are built to catch known credential formats and high-entropy (random-looking) strings;
+known AWS-format example key (the standard 20-character `AKIA...` placeholder AWS itself uses across its public documentation) in parallel — that
+one WAS caught. Conclusion: pattern/entropy-based scanners are built to
+catch known credential formats and high-entropy (random-looking) strings;
 a short, human-readable, low-entropy placeholder like `sk-local-dev-key`
 defeats both signals. **Fix:** wrote a custom `gitleaks` rule matching on
 variable-name *context* (`api_key`, `master_key`, `password`, etc.
@@ -477,6 +483,140 @@ direction, the fingerprint-matching claim, two different `[extends]`
 attempts. That's a more honest and more convincing demonstration of
 security engineering than a clean one-shot fix would have been.
 
+### Issue 9 — documenting Issue 8 tripped gitleaks' own default rule, revealing a CI design flaw
+
+**Symptom:** the very next commit — adding Issue 8's write-up to this
+README — failed CI. `gitleaks`'s built-in `aws-access-token` rule flagged
+the literal AWS example key (`AKIAIOSFODNN7EXAMPLE`) quoted in the prose
+above, in the OLD commit that introduced it. Removing the string in a new
+commit and re-running still failed, reporting the exact same old commit as
+the source.
+
+**Root cause, and it's bigger than this one string:** `gitleaks detect`
+scans full git *history* by default, every single run. That means any
+commit that ever existed gets flagged forever, regardless of what later
+commits fix — full-history scanning is the wrong design for a per-push CI
+gate, which should ask "did this push introduce a new problem," not "has
+this repo ever contained anything flaggable." A `--baseline-path` covers
+the custom rule (see Issue 8), but the plain default-rule scan had no
+baseline at all, so it would fail on this same finding forever.
+
+**Fix:** two changes, one immediate, one architectural.
+1. Rewrote the README line to avoid embedding a real-looking secret string
+   at all, rather than fighting the scanner further — good hygiene
+   independent of the tool.
+2. Reworked `secret-scan` in CI to compute the commit range introduced by
+   each push (`github.event.before..github.event.after`, falling back to
+   the latest commit for first-pushes/PR events) and pass it to `gitleaks`
+   via `--log-opts`, so both scans check only *new* commits. Full-history
+   scanning remains valuable as a separate, periodic/manual audit — which
+   is exactly what local `gitleaks detect --source .` runs during
+   development already provide.
+
+**Why this is a better answer than "I added an allowlist entry":**
+recognizing that the scan's *scope* was architecturally wrong, rather than
+patching around one specific false-positive-shaped string, is the kind of
+judgment call worth naming directly if asked about CI/CD design decisions.
+
+### Issue 10 — Trivy image scan: real fixes, a wrong assumption caught by re-scanning, and honest limits
+
+**Symptom:** `trivy image knowledge-assistant:local` reported 178
+vulnerabilities (3 CRITICAL, 53 HIGH). Overwhelming at a glance — the
+right response is triage, not panic-patching everything.
+
+**Triage:** ignore anything with no `Fixed Version` (no patch exists yet,
+so no action is possible regardless of severity). Of what remained,
+`python-multipart` (HIGH, DoS) and `pytest` (MEDIUM) were safe, direct
+`requirements.txt` bumps; `starlette` and `transformers` were left alone
+for now since bumping either is a major-version jump risking silent
+breakage of FastAPI or `sentence-transformers` compatibility.
+
+**A wrong assumption, caught by re-scanning rather than trusted:** added
+`RUN pip install --no-cache-dir --upgrade pip setuptools wheel` to the
+Dockerfile, assuming this would also address the OS-layer CVEs Trivy
+found (`perl-base` CRITICAL, `gzip`/`libpcre2`/`libsqlite3` HIGH). A
+re-scan showed the OS-layer HIGH+CRITICAL count **completely unchanged**
+— `pip install --upgrade` only touches Python packages; it has zero effect
+on Debian's `apt`-managed OS packages, a genuinely different package
+manager. **Real fix:** added `RUN apt-get update && apt-get upgrade -y` to
+patch the OS layer specifically. Re-scanning afterward confirmed it
+actually worked this time: CRITICAL count 3 → 0, OS HIGH+CRITICAL 56 → 44,
+and the base OS version itself changed (`debian 13.6` → `13.7`) —
+independent proof the upgrade really ran, not just a hopeful reading of
+the CVE list.
+
+**What legitimately remains, and why it's not a gap to hide:** the
+remaining ~44 OS findings (mostly `util-linux`-family CVEs, `libacl1`,
+`libsystemd0`, `ncurses`) all show no `Fixed Version` — Debian hasn't
+published patches yet. No Dockerfile change can fix a vulnerability with
+no upstream fix available; re-scanning periodically, not once, is the
+actual practice here.
+
+**Also found, not chased further:** a *second*, older, vendored copy of
+`setuptools` (70.3.0) and `msgpack` (1.1.2) appeared as HIGH after the fix
+— almost certainly bundled inside another package's own dependency tree
+(likely `torch` or `huggingface_hub`), separate from the top-level
+`setuptools` our fix upgraded. Named honestly as a known residual gap
+rather than claimed as fixed.
+
+### Issue 11 — a stale hardcoded fallback quietly broke local auth, and revealed CI's auth was never enforced at all
+
+**Symptom:** after rotating the LiteLLM secret (Issue 8) and rebuilding
+for the Trivy fixes, re-running the local eval suite failed with
+`openai.BadRequestError: No connected db.` — an error that sounds like a
+database problem but isn't.
+
+**Investigation:** rather than guess, searched for the exact error and
+found it's a known, actively-discussed LiteLLM behavior: **the error
+message is misleading.** LiteLLM only consults a database to validate a
+*virtual key*; a request using the correct master key never reaches that
+code path at all. "No connected db" on a master-key request means the key
+being sent does **not** match the configured master key — a key mismatch,
+not a missing database.
+
+**Root cause, two compounding gaps in our own earlier fix:**
+1. `app/config.py` still had `LITELLM_API_KEY = os.getenv("LITELLM_API_KEY", "sk-local-dev-key")`
+   — Issue 8 updated Compose, the Kubernetes manifests, and `.env.example`,
+   but this one hardcoded fallback was missed.
+2. Nothing in the app ever called `load_dotenv()`. Docker Compose
+   auto-injects `.env` into *containers*; the FastAPI app and
+   `eval/run_eval.py`, run directly on the host, never saw `.env` at all.
+
+Together: the host-run scripts fell back to the old `"sk-local-dev-key"`,
+which no longer matched the real rotated master key Compose was correctly
+using — a genuine mismatch, invisible until the actual key rotation made
+the two values diverge.
+
+**A second, more serious finding surfaced while fixing the first:**
+checking why CI's `eval-gate` job had kept passing throughout this entire
+session despite never setting `LITELLM_MASTER_KEY` anywhere revealed that
+LiteLLM was very likely running with **no authentication enforced at all**
+in CI — an unresolved `os.environ/LITELLM_MASTER_KEY` reference most
+likely leaves the master key unset, meaning any bearer token (including
+the stale local fallback) was silently accepted. Every earlier "green" CI
+run in this session passed without ever exercising real authentication.
+
+**Fix:**
+1. `config.py`: removed the hardcoded fallback entirely
+   (`os.environ["LITELLM_API_KEY"]` — fail loudly and immediately if
+   unset, rather than silently authenticating with a stale default), and
+   added an explicit `load_dotenv()` call so host-run scripts pick up
+   `.env` the same way Compose does for containers.
+2. Added `python-dotenv` to `requirements.txt` explicitly — it was
+   previously only present as an *undeclared* transitive dependency of
+   another package, which is fragile on its own regardless of this bug.
+3. CI: added a real GitHub Actions repository secret (`CI_LITELLM_KEY`)
+   and wired it into both the LiteLLM startup step and every Python step
+   that needs `LITELLM_API_KEY` — closing the silent-no-auth gap with a
+   properly-managed secret, not another hardcoded value.
+
+**Why this is worth telling in full, not just "fixed a bug":** the
+misleading error message, the discipline of searching for the exact error
+rather than guessing, and finding a *second*, more serious problem (CI's
+auth being silently disabled) purely as a side effect of fixing the first
+— that sequence is a better demonstration of debugging judgment than
+either fix would be alone.
+
 ## Interview talking points
 
 - "I built the AI-specific layer (vector search, model serving, gateway) the
@@ -503,3 +643,15 @@ security engineering than a clean one-shot fix would have been.
   regex lookahead in Go/RE2), and two of my own assumptions proven wrong by
   direct testing before landing on the robust fix. Good default answer to
   "tell me about a security issue you found and fixed yourself."
+- Issue 9 is a good answer to "how do you design CI/CD for security
+  gates" — recognizing full-history scanning was the wrong scope for a
+  per-push gate, not just patching the specific failure.
+- Issue 10 is a good answer to "how do you handle vulnerability scan
+  results" — triage by fixability, verify fixes by re-scanning rather than
+  trusting the change, and catch your own wrong assumption (pip vs. apt)
+  before claiming victory.
+- Issue 11 is arguably the best story in the repo for "tell me about a bug
+  that turned out worse than it looked" — a misleading error message, a
+  root cause found by searching rather than guessing, and a second, more
+  serious problem (CI silently running with no authentication) discovered
+  purely as a side effect of fixing the first.
