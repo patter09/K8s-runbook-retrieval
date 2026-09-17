@@ -100,19 +100,20 @@ jobs:
           ollama pull llama3.2:3b
 
       - name: Start LiteLLM gateway
-        # OLLAMA_API_BASE=localhost here (not the "ollama" hostname used in
-        # docker-compose.yml) because in this CI job Ollama runs as a plain
-        # process on the runner, not as a Docker Compose service — there's
-        # no container DNS name to resolve.
         env:
           OLLAMA_API_BASE: http://localhost:11434
+          LITELLM_MASTER_KEY: ${{ secrets.CI_LITELLM_KEY }}
         run: |
           pip install 'litellm[proxy]'
           litellm --config litellm_config.yaml --port 4000 &
           sleep 5
 
       - name: Ingest sample docs
+        env:
+          LITELLM_API_KEY: ${{ secrets.CI_LITELLM_KEY }}
         run: python app/ingest.py data/sample_docs
 
       - name: Run eval gate
+        env:
+          LITELLM_API_KEY: ${{ secrets.CI_LITELLM_KEY }}
         run: python eval/run_eval.py --threshold 0.75
