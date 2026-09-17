@@ -24,6 +24,7 @@ LITELLM_BASE_URL = os.getenv("LITELLM_BASE_URL", "http://localhost:4000")
 # and immediately rather than silently authenticating with a stale or
 # guessable default value.
 LITELLM_API_KEY = os.environ["LITELLM_API_KEY"]
+APP_API_KEY = os.environ["APP_API_KEY"]
 LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "knowledge-assistant")
 
 TOP_K = int(os.getenv("TOP_K", "3"))

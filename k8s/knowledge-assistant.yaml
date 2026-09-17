@@ -41,6 +41,11 @@ spec:
                 secretKeyRef:
                   name: litellm-credentials
                   key: api-key
+            - name: APP_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: app-credentials
+                  key: api-key
             - name: LLM_MODEL_NAME
               value: "knowledge-assistant"
           readinessProbe:
