@@ -111,9 +111,11 @@ jobs:
       - name: Ingest sample docs
         env:
           LITELLM_API_KEY: ${{ secrets.CI_LITELLM_KEY }}
+          APP_API_KEY: ${{ secrets.CI_APP_KEY }}
         run: python app/ingest.py data/sample_docs
 
       - name: Run eval gate
         env:
           LITELLM_API_KEY: ${{ secrets.CI_LITELLM_KEY }}
+          APP_API_KEY: ${{ secrets.CI_APP_KEY }}
         run: python eval/run_eval.py --threshold 0.75
