@@ -1,3 +1,14 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: audit-db-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Mi
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -48,12 +59,24 @@ spec:
                   key: api-key
             - name: LLM_MODEL_NAME
               value: "knowledge-assistant"
+            # Points audit.py at a path inside the mounted volume below,
+            # instead of the container's ephemeral filesystem default —
+            # this is what makes the audit trail survive a pod restart.
+            - name: AUDIT_DB_PATH
+              value: "/data/audit.db"
+          volumeMounts:
+            - name: audit-db
+              mountPath: /data
           readinessProbe:
             httpGet:
               path: /health
               port: 8000
             initialDelaySeconds: 5
             periodSeconds: 5
+      volumes:
+        - name: audit-db
+          persistentVolumeClaim:
+            claimName: audit-db-pvc
 ---
 apiVersion: v1
 kind: Service

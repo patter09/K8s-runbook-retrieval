@@ -6,6 +6,7 @@ from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
 from prometheus_fastapi_instrumentator import Instrumentator
 
+import audit
 import config
 from rag import answer_question
 from guardrails import check_input, check_output
@@ -15,6 +16,7 @@ logger = logging.getLogger("knowledge-assistant")
 
 app = FastAPI(title="DevOps Knowledge Assistant")
 Instrumentator().instrument(app).expose(app)  # exposes /metrics for Prometheus
+audit.init_db()
 
 # APIKeyHeader reads the "X-API-Key" header; auto_error=False lets us return
 # our own 401 (with a clear message) instead of FastAPI's generic one.
@@ -62,6 +64,16 @@ def query(req: QueryRequest, api_key: str = Depends(verify_api_key)):
     )
 
     if input_check["blocked"]:
+        audit.log_request(
+            api_key=api_key,
+            # sanitized_text, not req.question — same PII-redaction
+            # discipline as the answer field below. Storing the raw
+            # question here would defeat the point of redacting PII at
+            # all, since it would just reappear in the audit log.
+            question=input_check["sanitized_text"],
+            status="blocked_injection",
+            pii_found_input=input_check["pii_found"],
+        )
         raise HTTPException(
             status_code=400,
             detail="Request blocked by input guardrail (possible prompt injection).",
@@ -72,5 +84,15 @@ def query(req: QueryRequest, api_key: str = Depends(verify_api_key)):
     output_check = check_output(result["answer"])
     if output_check["pii_found"]:
         logger.warning("output_pii_redacted", extra={"categories": output_check["pii_found"]})
+
+    audit.log_request(
+        api_key=api_key,
+        question=input_check["sanitized_text"],
+        status="allowed",
+        answer=output_check["sanitized_text"],
+        sources=result["sources"],
+        pii_found_input=input_check["pii_found"],
+        pii_found_output=output_check["pii_found"],
+    )
 
     return QueryResponse(answer=output_check["sanitized_text"], sources=result["sources"])

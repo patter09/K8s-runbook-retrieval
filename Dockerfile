@@ -2,7 +2,7 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get upgrade -y && apt-get install -y sqlite3 && rm -rf /var/lib/apt/lists/*
 
 # Install dependencies first (separate layer) so code changes don't force
 # a full reinstall of everything, including the heavy torch/transformers
