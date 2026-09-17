@@ -28,13 +28,16 @@ which one, so you can talk through the mapping in an interview.
                                       └─────────────┘
                                              ▲
                                              │ retrieve
-  client ──▶ FastAPI /query ─────────────────┘
-                  │
-                  ▼
-            LiteLLM Proxy  (AI gateway: auth, rate limits, cost/token logging)
-                  │
-                  ▼
-               Ollama  (local LLM serving — llama3.2:3b)
+  client ──▶ [X-API-Key auth] ──▶ FastAPI /query
+                  │                         │
+                  │ (blocked or allowed,    ▼
+                  │  redacted) ──▶   LiteLLM Proxy  (AI gateway: auth, rate limits, cost/token logging)
+                  ▼                         │
+          audit.db (SQLite,                 ▼
+          on a Kubernetes PVC —        Ollama  (local LLM serving — llama3.2:3b)
+          survives pod restarts,
+          verified by killing a pod
+          and re-reading the row)
 
   FastAPI also exposes /metrics ──▶ Prometheus ──▶ Grafana
   guardrails.py runs on every request (PII filter, prompt-injection check)
@@ -67,6 +70,8 @@ this isn't an assumption, it was actually tested by running the same
 | `eval/run_eval.py` + GitHub Actions | MLOps/LLMOps CI/CD, model/prompt lifecycle management |
 | Prometheus + Grafana | Observability, platform reliability |
 | `guardrails.py` | Responsible AI, governance, auditability |
+| `app/audit.py` | Durable audit logging (CloudTrail/Activity-Log style), auditability |
+| API key auth on `/query` | Access control, defense-in-depth |
 | `infra/terraform/` + `k8s/` | Cloud-native infra, IaC, Kubernetes |
 
 ## Running on Kubernetes (primary path)
@@ -211,16 +216,20 @@ DevOps-background candidates skip, and it's worth walking through explicitly.
   scanning (Trivy — see Issue 10, OS layer patched, Python-layer CVEs
   bumped, unfixed/vendored findings named honestly rather than hidden), no
   hardcoded credentials anywhere (env-var references, Kubernetes `Secret`
-  objects via `secretKeyRef`, a real GitHub Actions repository secret for
-  CI — see Issue 11), and the existing `guardrails.py` input/output
-  filtering. **Not yet implemented**, and worth naming explicitly rather
-  than glossing over: static analysis on `app/*.py` (SAST, e.g.
-  SonarCloud), dynamic scanning of the running API (DAST, e.g. OWASP ZAP),
-  Kubernetes RBAC scoping each pod to least privilege, Kyverno policies
-  (e.g. enforcing non-root containers), and any authentication at all on
-  the `/query` endpoint itself (as opposed to the LiteLLM gateway behind
-  it, which now genuinely enforces a master key — see Issue 11). Given the
-  CV skills this project maps against (SAST, DAST, RBAC, defense-in-depth),
+  objects via `secretKeyRef`, real GitHub Actions repository secrets for
+  CI — see Issue 11), API key authentication on `/query` itself (constant-
+  time comparison via `secrets.compare_digest`, tested against all four
+  cases: missing key, wrong key, correct key, and the unauthenticated
+  `/health` readiness-probe exception — see Issue 12), durable audit
+  logging (SQLite on a Kubernetes PVC, PII-redacted before storage,
+  verified to survive an actual pod deletion, not just assumed to — see
+  Issues 13-15), and the existing `guardrails.py` input/output filtering.
+  **Not yet implemented**, and worth naming explicitly rather than
+  glossing over: static analysis on `app/*.py` (SAST, e.g. SonarCloud),
+  dynamic scanning of the running API (DAST, e.g. OWASP ZAP), Kubernetes
+  RBAC scoping each pod to least privilege, and Kyverno policies (e.g.
+  enforcing non-root containers). Given the CV skills this project maps
+  against (SAST, DAST, RBAC, defense-in-depth),
   this is the most valuable remaining phase, not an afterthought.
 
 ## Debugging log — what actually broke, and how it was fixed
@@ -487,7 +496,7 @@ security engineering than a clean one-shot fix would have been.
 
 **Symptom:** the very next commit — adding Issue 8's write-up to this
 README — failed CI. `gitleaks`'s built-in `aws-access-token` rule flagged
-the literal AWS example key (the standard 20-character `AKIA...`) quoted in the prose
+the literal AWS example key (`AKIAIOSFODNN7EXAMPLE`) quoted in the prose
 above, in the OLD commit that introduced it. Removing the string in a new
 commit and re-running still failed, reporting the exact same old commit as
 the source.
@@ -617,6 +626,126 @@ auth being silently disabled) purely as a side effect of fixing the first
 — that sequence is a better demonstration of debugging judgment than
 either fix would be alone.
 
+### Issue 12 — adding API auth required propagating one new env var through five places, none optional
+
+**Context:** added API key authentication to `/query` itself — a
+`FastAPI` `Security` dependency reading an `X-API-Key` header, checked
+with `secrets.compare_digest` rather than `==` (plain string equality
+short-circuits on the first mismatched character, which leaks timing
+information about how many leading characters were correct — a real,
+if minor, side-channel; constant-time comparison avoids it entirely).
+
+**What made this genuinely multi-step, not a one-line change:** a new
+required env var (`APP_API_KEY`, no hardcoded fallback — same
+no-fallback discipline as `LITELLM_API_KEY` after Issue 11) had to be
+threaded through every place that runs this code: local `.env` and
+`.env.example`, a new Kubernetes `Secret` (`app-credentials`, via
+`secretKeyRef` — never a literal value in YAML), and a new GitHub
+Actions repository secret (`CI_APP_KEY`) wired into both CI steps that
+import `config.py`. Missing any single one of these fails loudly (a
+`KeyError` at import time, by design) rather than silently — which is
+exactly what happened with the CI step on the first push, caught and
+fixed immediately rather than discovered later.
+
+**Verified with the full test matrix, not just the happy path:** no key
+→ `401 "Missing X-API-Key header."`; wrong key → `401 "Invalid API
+key."`; correct key → `200` with a real answer; `/health` → `200` with
+no key at all (deliberately excluded from auth, since Kubernetes'
+`readinessProbe` has no way to supply credentials).
+
+### Issue 13 — a Kubernetes Secret was created empty, from the wrong working directory
+
+**Symptom:** after wiring `APP_API_KEY` through Kubernetes, `/query`
+returned `401 "Invalid API key."` even with the correct key.
+
+**Root cause:** `kubectl create secret generic app-credentials
+--from-literal=api-key=$(grep APP_API_KEY .env | cut -d= -f2)` was run
+from a directory without `.env` present, so the `$(...)` substitution
+silently evaluated to an empty string — `kubectl` created the Secret
+anyway, since an empty value is technically still valid input. No error
+anywhere in the chain; the failure only surfaced as a downstream auth
+mismatch.
+
+**Fix:** deleted and recreated the Secret from the project root,
+verified immediately by decoding it back
+(`kubectl get secret ... | base64 -d`) and comparing directly against
+`.env`'s value — the same "verify, don't trust it worked" discipline
+this project has needed repeatedly. Also surfaced a second, easy-to-miss
+fact: **Kubernetes does not automatically restart pods when a Secret
+they reference changes** — the already-running pod kept using the old
+(empty) value until `kubectl rollout restart` forced it to pick up the
+correction.
+
+### Issue 14 — same-tag image updates don't automatically reach running pods
+
+**Symptom:** after rebuilding the app image (to add `audit.py`) and
+`kind load docker-image`-ing it into the cluster, `kubectl apply`
+reported the Deployment as `unchanged`, and the running pod's age (42
+minutes) proved it was still serving the *old* image, despite a
+successful build and load.
+
+**Root cause:** the image tag (`knowledge-assistant:local`) never
+changes between rebuilds, and `imagePullPolicy: Never` means Kubernetes
+won't re-pull it — so nothing in the Deployment spec actually changed
+from Kubernetes' point of view, even though the image *content* behind
+that tag did. `kubectl apply` only acts on spec changes, not on "the
+same tag now points to different bytes."
+
+**Fix:** `kubectl rollout restart deployment/knowledge-assistant`,
+which forces new pods regardless of whether the spec changed. **Real-
+world equivalent worth naming:** production systems avoid this entirely
+by tagging images uniquely per build (a git SHA, a build number) so a
+new image is *always* a genuine spec change — `:local`/`:latest`-style
+floating tags are a demo-project simplification, not a practice to
+carry into production.
+
+### Issue 15 — durable audit logging needed a genuine kill-and-recover test, and turned up two more real bugs along the way
+
+**The actual test, not just the design:** wrote a row to the audit
+database, deliberately ran `kubectl delete pod` on the pod that wrote
+it, waited for a replacement pod to come up, and confirmed the exact
+same row (same `id`, same original timestamp) was still there —
+real proof a PersistentVolumeClaim was doing its job, not an assumption
+based on `STATUS: Bound`.
+
+**Bug found along the way — missing OS-level tool.** Inspecting the
+database via `kubectl exec ... sqlite3 ...` failed with
+`executable file not found` — a reasonable-looking fix
+(`pip install sqlite3` in `requirements.txt`) would have been wrong:
+Python's `sqlite3` *module*, used by `app/audit.py`, is already part of
+the standard library; the missing piece was the separate `sqlite3`
+*command-line binary*, an OS package (`apt`, not `pip`) needed only for
+manual debugging, not by the app itself.
+
+**A second bug while adding it — apt-get argument order.** The first
+attempt, `apt-get upgrade -y && rm -rf /var/lib/apt/lists/* && apt-get
+install -y sqlite3`, failed with "Unable to locate package": the cleanup
+step deleted apt's package index *before* the install ran. Fix: reorder
+so every install happens before the cleanup,
+`apt-get upgrade -y && apt-get install -y sqlite3 && rm -rf /var/lib/apt/lists/*`.
+
+**A real, substantive bug found by re-reading the code, not by an
+error:** the audit log stored `req.question` (the raw, un-redacted
+question) even though `output_check["sanitized_text"]` (the redacted
+answer) was correctly stored for the answer field. If a question itself
+contained PII, guardrails would correctly redact it before it reached
+the LLM — but the audit trail would still have captured the original,
+unredacted text, quietly defeating half the point of having redaction
+at all. Fixed by logging `input_check["sanitized_text"]` instead,
+before committing the feature rather than after.
+
+**A new gitleaks false positive, from a fingerprint's commit-specific
+nature.** The new `audit.log_request(api_key=api_key, ...)` calls
+matched the custom secret-scanning rule from Issue 8 (`api_key=` shape),
+purely because the *variable* is named `api_key` — same class of false
+positive as the earlier `app/rag.py` one, but a **new** fingerprint,
+since baseline fingerprints are tied to the specific commit that
+introduced them. This is the commit-specific-baseline limitation flagged
+as a known caveat back in Issue 8, now observed for real. Fixed the
+same verified-safe way as before: generate a fresh, tool-produced scan,
+merge only the genuinely new fingerprints into the existing baseline
+programmatically, never hand-type or edit field values.
+
 ## Interview talking points
 
 - "I built the AI-specific layer (vector search, model serving, gateway) the
@@ -655,3 +784,10 @@ either fix would be alone.
   root cause found by searching rather than guessing, and a second, more
   serious problem (CI silently running with no authentication) discovered
   purely as a side effect of fixing the first.
+- Issues 12-15 (API auth + durable audit logging) are good answers to
+  "how do you approach access control and auditability" — a real,
+  tested-against-all-cases auth check, a genuinely verified persistence
+  test (kill the pod, prove the data survives, don't just trust the PVC
+  status), and catching a real PII-redaction gap (the audit log storing
+  raw rather than sanitized question text) by re-reading the code rather
+  than waiting for it to fail.
