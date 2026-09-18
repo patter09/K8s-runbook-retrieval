@@ -11,7 +11,16 @@ import re
 
 EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 PHONE_RE = re.compile(r"\b(?:\+?\d{1,3}[-.\s]?)?\(?\d{3,4}\)?[-.\s]?\d{3,4}[-.\s]?\d{3,4}\b")
-CARD_RE = re.compile(r"\b(?:\d[ -]*?){13,16}\b")
+# Rewritten from \b(?:\d[ -]*?){13,16}\b (flagged by SonarCloud SAST as
+# both a super-linear/catastrophic-backtracking risk AND a reluctant
+# quantifier that could only ever match 0 repetitions in practice — the
+# same nested `[ -]*?` inside a bounded outer repeat caused both). This
+# is a genuine ReDoS concern, not just a lint nit: contains_pii() runs on
+# every request and response, so a pathological input could exploit it.
+# Fixed by bounding the separator to 0-or-1 (`?`, not `*?`) per digit,
+# with a fixed-width repeated unit — no nested unbounded quantifier left
+# for the engine to backtrack across.
+CARD_RE = re.compile(r"\b\d(?:[ -]?\d){12,15}\b")
 
 INJECTION_PATTERNS = [
     "ignore previous instructions",
@@ -36,9 +45,17 @@ def contains_pii(text: str) -> list[str]:
 
 
 def redact_pii(text: str) -> str:
+    # Order matters here, and it's not arbitrary: CARD_RE (13-16 digits)
+    # runs BEFORE PHONE_RE, because a card-number-shaped string can
+    # partially satisfy PHONE_RE's shorter, more general pattern (groups
+    # of 3-4 digits separated by dashes). Found by a real test failure:
+    # with PHONE_RE running first, "4111-1111-1111-1111" got partially
+    # consumed as "[REDACTED_PHONE]-1111" before CARD_RE ever saw the
+    # intact digit sequence, leaving a corrupted, half-redacted result.
+    # The more specific/longer pattern needs first claim on the digits.
     text = EMAIL_RE.sub("[REDACTED_EMAIL]", text)
-    text = PHONE_RE.sub("[REDACTED_PHONE]", text)
     text = CARD_RE.sub("[REDACTED_NUMBER]", text)
+    text = PHONE_RE.sub("[REDACTED_PHONE]", text)
     return text
 
 

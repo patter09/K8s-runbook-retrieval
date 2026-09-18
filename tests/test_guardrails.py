@@ -40,3 +40,19 @@ def test_check_input_blocks_injection():
 def test_check_input_allows_normal_question():
     result = check_input("How do I resolve a Terraform state lock?")
     assert result["blocked"] is False
+
+
+def test_detects_card_number_no_separators():
+    # No prior test covered CARD_RE at all before this fix — closing that
+    # gap, not just verifying the rewritten regex still works.
+    assert "card_number_like" in contains_pii("my card is 4111111111111111 expiring soon")
+
+
+def test_detects_card_number_with_dashes():
+    assert "card_number_like" in contains_pii("card: 4111-1111-1111-1111")
+
+
+def test_redacts_card_number():
+    redacted = redact_pii("charge 4111-1111-1111-1111 please")
+    assert "4111-1111-1111-1111" not in redacted
+    assert "[REDACTED_NUMBER]" in redacted

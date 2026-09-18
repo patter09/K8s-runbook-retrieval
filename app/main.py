@@ -1,5 +1,6 @@
 import logging
 import secrets
+from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Security
 from fastapi.security import APIKeyHeader
@@ -52,8 +53,12 @@ def health():
     return {"status": "ok"}
 
 
-@app.post("/query", response_model=QueryResponse)
-def query(req: QueryRequest, api_key: str = Depends(verify_api_key)):
+@app.post(
+    "/query",
+    response_model=QueryResponse,
+    responses={400: {"description": "Request blocked by an input guardrail (e.g. possible prompt injection)."}},
+)
+def query(req: QueryRequest, api_key: Annotated[str, Depends(verify_api_key)]):
     input_check = check_input(req.question)
 
     # Audit log every request's governance result — this is what makes the
