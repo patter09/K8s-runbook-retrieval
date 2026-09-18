@@ -190,5 +190,53 @@
     ],
     "RuleID": "generic-secret-assignment",
     "Fingerprint": "3a1ea6d1960e27ab2bd6e6c2a30b759e29afc5e7:README.md:generic-secret-assignment:428"
+  },
+  {
+    "Description": "Catches any value assigned to a common secret/key/token/password variable name, regardless of entropy. Deliberately excludes '.' from the value charset so os.environ/... and os.getenv(...) reference patterns don't match (they stop at the first '.', falling below the 6-char minimum) \u2014 those are safe indirection, not literal secrets.",
+    "StartLine": 61,
+    "EndLine": 61,
+    "StartColumn": 31,
+    "EndColumn": 48,
+    "Match": "api_key: Annotated",
+    "Secret": "api_key: Annotated",
+    "File": "app/main.py",
+    "SymlinkFile": "",
+    "Commit": "8805db9a2e7e424ead1ef3e5cdf4f27595f1d94b",
+    "Entropy": 3.7254806,
+    "Author": "patter09",
+    "Email": "pratikme12@gmail.com",
+    "Date": "2026-09-18T13:23:08Z",
+    "Message": "Fix all 4 SonarCloud findings (ReDoS-prone regex, FastAPI docs, Annotated type hints) and an independent PII-redaction ordering bug found by the new regression test",
+    "Tags": [
+      "custom",
+      "generic-secret",
+      "low-entropy"
+    ],
+    "RuleID": "generic-secret-assignment",
+    "Fingerprint": "8805db9a2e7e424ead1ef3e5cdf4f27595f1d94b:app/main.py:generic-secret-assignment:61"
+  },
+  {
+    "Description": "Catches any value assigned to a common secret/key/token/password variable name, regardless of entropy. Deliberately excludes '.' from the value charset so os.environ/... and os.getenv(...) reference patterns don't match (they stop at the first '.', falling below the 6-char minimum) \u2014 those are safe indirection, not literal secrets.",
+    "StartLine": 738,
+    "EndLine": 738,
+    "StartColumn": 39,
+    "EndColumn": 53,
+    "Match": "api_key=api_key",
+    "Secret": "api_key=api_key",
+    "File": "README.md",
+    "SymlinkFile": "",
+    "Commit": "469e861c5f1ac5ce4090441c116d21b9082a3306",
+    "Entropy": 2.9735572,
+    "Author": "patter09",
+    "Email": "pratikme12@gmail.com",
+    "Date": "2026-09-17T13:35:16Z",
+    "Message": "Document Issues 12-15: API auth, durable audit logging, and the bugs found building both",
+    "Tags": [
+      "custom",
+      "generic-secret",
+      "low-entropy"
+    ],
+    "RuleID": "generic-secret-assignment",
+    "Fingerprint": "469e861c5f1ac5ce4090441c116d21b9082a3306:README.md:generic-secret-assignment:738"
   }
 ]
