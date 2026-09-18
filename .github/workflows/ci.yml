@@ -5,6 +5,32 @@ on:
   pull_request:
 
 jobs:
+  sast-scan:
+    # SAST — analyzes app/*.py source code itself for injection risks,
+    # unsafe patterns, and code smells. Different layer from everything
+    # else in this pipeline: gitleaks looks for secrets, Trivy looks at
+    # dependency versions, Kyverno looks at infrastructure config — this
+    # is the first tool that actually reads our application logic.
+    #
+    # Deliberately NOT gating the build on a quality gate yet (same
+    # "Audit before Enforce" reasoning as the Kyverno policies) — this is
+    # the first static analysis this codebase has ever had, so we don't
+    # yet know what it will find. Review results on the SonarCloud
+    # dashboard first; add a blocking quality-gate check once the
+    # baseline is actually clean, the same sequencing used for the
+    # Kyverno policies.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarqube-scan-action@v4
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: https://sonarcloud.io
+          
   secret-scan:
     # Fastest possible check, runs first, blocks everything else — same
     # "fail fast" reasoning as guardrail-unit-tests, but for secrets
