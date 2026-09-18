@@ -1,0 +1,43 @@
+# Audit mode, not Enforce — every one of our own manifests currently uses
+# a floating tag (qdrant:latest, ollama:latest, litellm:main-latest,
+# prometheus:latest, grafana:latest), so Enforce would immediately block
+# our own cluster. This is the direct, concrete motivation for the
+# policy in the first place: Issue 14 in the README documents exactly
+# the operational problem floating tags cause (a rebuilt image silently
+# not reaching a running pod without a manual rollout restart, since the
+# tag itself never changes). Auditing first shows the real scope of the
+# problem before deciding whether/how to fix it fleet-wide.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-latest-tag
+spec:
+  validationFailureAction: Audit
+  background: true
+  rules:
+    - name: require-image-tag
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      validate:
+        message: "Images must not use the ':latest' tag (or no tag at all, which defaults to it) — pin to a specific version or digest."
+        foreach:
+          - list: "request.object.spec.containers"
+            deny:
+              conditions:
+                any:
+                  # "latest" as a substring anywhere in the image string,
+                  # not an exact ":latest" match — this specifically
+                  # catches tags like "main-latest" (ghcr.io/berriai/
+                  # litellm:main-latest) that contain "latest" without
+                  # being an exact match on ":latest". Verified this
+                  # mattered directly: the ":latest"-only version of this
+                  # check let litellm's floating tag pass silently.
+                  - key: "{{ contains(element.image, 'latest') }}"
+                    operator: Equals
+                    value: true
+                  - key: "{{ contains(element.image, ':') }}"
+                    operator: Equals
+                    value: false

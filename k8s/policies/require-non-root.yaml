@@ -1,0 +1,33 @@
+# Audit mode, not Enforce: this records violations without blocking
+# anything. None of our current manifests set runAsNonRoot, so Enforce
+# would immediately block every future change to any of them. Standard
+# real-world practice: run new policies in Audit first, see what the
+# existing fleet actually violates, fix those, THEN switch to Enforce —
+# never flip a new policy straight to blocking against workloads it was
+# never checked against.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-non-root
+spec:
+  validationFailureAction: Audit
+  background: true
+  rules:
+    - name: check-runAsNonRoot
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      validate:
+        message: "Pod must set spec.securityContext.runAsNonRoot: true"
+        # No =(...) conditional anchors this time — those mean "IF this
+        # field is present, it must match," which is a no-op when the
+        # field never exists at all (confirmed directly: the first version
+        # of this policy reported "pass" for knowledge-assistant, a
+        # workload verified to have no securityContext set anywhere). A
+        # plain pattern REQUIRES the field to be present and matching.
+        pattern:
+          spec:
+            securityContext:
+              runAsNonRoot: true
