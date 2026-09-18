@@ -223,14 +223,23 @@ DevOps-background candidates skip, and it's worth walking through explicitly.
   `/health` readiness-probe exception — see Issue 12), durable audit
   logging (SQLite on a Kubernetes PVC, PII-redacted before storage,
   verified to survive an actual pod deletion, not just assumed to — see
-  Issues 13-15), and the existing `guardrails.py` input/output filtering.
-  **Not yet implemented**, and worth naming explicitly rather than
-  glossing over: static analysis on `app/*.py` (SAST, e.g. SonarCloud),
-  dynamic scanning of the running API (DAST, e.g. OWASP ZAP), Kubernetes
-  RBAC scoping each pod to least privilege, and Kyverno policies (e.g.
-  enforcing non-root containers). Given the CV skills this project maps
-  against (SAST, DAST, RBAC, defense-in-depth),
-  this is the most valuable remaining phase, not an afterthought.
+  Issues 13-15), RBAC (`automountServiceAccountToken: false` on all 6
+  workloads, since none of them ever call the Kubernetes API — verified by
+  reading the actual mounted token before the fix and confirming the
+  directory is gone afterward — see Issue 16), and two Kyverno policies in
+  Audit mode (require non-root containers, disallow floating image tags —
+  see Issue 17, where both policies turned out to have real bugs of their
+  own, caught by testing against known-true and known-false cases rather
+  than trusting a clean `kubectl apply`), plus the existing
+  `guardrails.py` input/output filtering. **Not yet implemented**, and
+  worth naming explicitly rather than glossing over: static analysis on
+  `app/*.py` (SAST, e.g. SonarCloud), dynamic scanning of the running API
+  (DAST, e.g. OWASP ZAP), and actually fixing the violations the Kyverno
+  policies found (no manifest sets `runAsNonRoot`, and 5 of 6 images use a
+  floating tag) — Audit mode reports the problem, it doesn't fix it.
+  Given the CV skills this project maps against (SAST, DAST, RBAC,
+  defense-in-depth), this is the most valuable remaining phase, not an
+  afterthought.
 
 ## Debugging log — what actually broke, and how it was fixed
 
@@ -496,7 +505,8 @@ security engineering than a clean one-shot fix would have been.
 
 **Symptom:** the very next commit — adding Issue 8's write-up to this
 README — failed CI. `gitleaks`'s built-in `aws-access-token` rule flagged
-the literal AWS example key (example `AKIA.....`) quoted in the prose
+the literal AWS example key (the same one described in Issue 8, above)
+quoted in the prose
 above, in the OLD commit that introduced it. Removing the string in a new
 commit and re-running still failed, reporting the exact same old commit as
 the source.
@@ -746,6 +756,78 @@ same verified-safe way as before: generate a fresh, tool-produced scan,
 merge only the genuinely new fingerprints into the existing baseline
 programmatically, never hand-type or edit field values.
 
+### Issue 16 — every pod had a live, unused Kubernetes API credential by default
+
+**How this was found:** while scoping what RBAC should actually restrict
+for this project, realized none of the 6 workloads (Qdrant, Ollama,
+LiteLLM, the app, Prometheus, Grafana) ever call the Kubernetes API at
+all — so a `Role`/`RoleBinding` granting narrow permissions isn't really
+the relevant control; there's nothing legitimate for them to be granted
+access *to*. Checked whether that meant the risk was purely theoretical,
+by looking directly at a running pod:
+`kubectl exec ... -- cat /var/run/secrets/kubernetes.io/serviceaccount/token`
+returned a live, valid, decodable JWT — every pod gets one auto-mounted
+by default, whether it uses it or not.
+
+**Fix:** `automountServiceAccountToken: false` added to all 6 Deployment
+pod specs — removing the unused credential entirely, rather than
+granting it scoped permissions it would never exercise. Verified, not
+assumed: after redeploying, the same `cat` command against the same
+path returned "No such file or directory" — the mount point itself was
+gone, not just empty.
+
+**What broke while verifying it, and why it was unrelated:** redeploying
+all 6 manifests recreated the Qdrant and Ollama pods, which — per
+Issues 5, 6, 13, and 15 — still have no PersistentVolume. This is now
+the **fourth** time this exact gap has caused a real interruption in
+this session, which has turned it from a documented "known
+simplification" into a genuine, evidence-backed priority for the next
+piece of work, not a footnote.
+
+### Issue 17 — two Kyverno policies, both with real bugs, both found by testing against a known-true case
+
+**Context:** wrote two Kyverno `ClusterPolicy` resources in `Audit` mode
+(reports violations, blocks nothing) — require non-root containers, and
+disallow floating image tags. Deliberately Audit rather than Enforce,
+since every one of our own images uses a floating tag (`qdrant:latest`,
+`ollama:latest`, `litellm:main-latest`, `prometheus:latest`,
+`grafana:latest`) and Enforce would have immediately blocked our own
+cluster.
+
+**Bug 1 — the non-root policy was a silent no-op.** The first version
+used Kyverno's `=(...)` conditional-anchor syntax, which means "if this
+field is present, it must match" — not "this field must be present."
+Since no manifest sets `securityContext` at all, the field was simply
+absent everywhere, the anchor had nothing to check, and the policy
+reported `pass` for every single workload, including ones verified by
+hand to have no `securityContext` anywhere. **Caught by testing against
+a known-true case** (checking the actual report for `knowledge-assistant`
+specifically, a workload known for certain to violate the rule) rather
+than trusting the policy applied cleanly. **Fix:** removed the
+conditional anchors so the field is genuinely required; re-verified the
+same known-true case now correctly reports `fail`.
+
+**Bug 2 — the tag policy had a substring blind spot.** The first version
+checked for the exact substring `:latest`. `litellm`'s image is tagged
+`main-latest` — the full string contains `:main-latest`, not `:latest`,
+so it silently passed despite being just as floating a tag as any other.
+**Predicted this gap before even testing it** (worth noting: predicting
+a bug and then confirming it empirically is a stronger habit than either
+alone), then confirmed it directly in the policy report, then fixed it
+by checking for `latest` anywhere in the string rather than requiring an
+exact `:latest` match — a deliberately named trade-off, since this
+wider check could in principle also flag a repository path that merely
+contains the word "latest" without it being the actual tag; acceptable
+here since Audit mode blocks nothing and none of our real images hit
+that edge case.
+
+**Final verification, not just individual spot-checks:** wrote a script
+querying every Deployment's `PolicyReport` at once, confirming all 6
+workloads now correctly fail `require-non-root`, and exactly the 5 with
+a real floating tag fail `disallow-latest-tag` (`knowledge-assistant`,
+pinned to `:local`, correctly passes) — a full matrix check, not just
+confirming the two cases that were already known to be wrong.
+
 ## Interview talking points
 
 - "I built the AI-specific layer (vector search, model serving, gateway) the
@@ -791,3 +873,9 @@ programmatically, never hand-type or edit field values.
   status), and catching a real PII-redaction gap (the audit log storing
   raw rather than sanitized question text) by re-reading the code rather
   than waiting for it to fail.
+- Issues 16-17 (RBAC + Kyverno) are a good answer to "how do you approach
+  least privilege in Kubernetes" — recognizing that the relevant risk was
+  an unused, auto-mounted credential rather than missing RBAC grants, and
+  that both Kyverno policies looked correct but were silently no-ops or
+  had real blind spots until tested against cases already known to be
+  true or false, not just applied and trusted.
