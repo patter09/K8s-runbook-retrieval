@@ -37,6 +37,7 @@ spec:
       labels:
         app: litellm
     spec:
+      automountServiceAccountToken: false
       containers:
         - name: litellm
           image: ghcr.io/berriai/litellm:main-latest

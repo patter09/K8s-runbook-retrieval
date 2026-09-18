@@ -25,6 +25,15 @@ spec:
       labels:
         app: knowledge-assistant
     spec:
+      # This pod never calls the Kubernetes API — the auto-mounted service
+      # account token (present by default on every pod, whether it's used
+      # or not) is pure unused attack surface. Verified directly: without
+      # this line, `kubectl exec ... -- cat /var/run/secrets/.../token`
+      # returns a live, valid credential. Removing the mount entirely,
+      # rather than granting narrow RBAC permissions, is the correct fix
+      # here — there is no legitimate Kubernetes API action for this pod
+      # to need permission for in the first place.
+      automountServiceAccountToken: false
       containers:
         - name: knowledge-assistant
           image: knowledge-assistant:local

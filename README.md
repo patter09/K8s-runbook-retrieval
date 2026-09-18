@@ -496,7 +496,7 @@ security engineering than a clean one-shot fix would have been.
 
 **Symptom:** the very next commit — adding Issue 8's write-up to this
 README — failed CI. `gitleaks`'s built-in `aws-access-token` rule flagged
-the literal AWS example key (`AKIAIOSFODNN7EXAMPLE`) quoted in the prose
+the literal AWS example key (example `AKIA.....`) quoted in the prose
 above, in the OLD commit that introduced it. Removing the string in a new
 commit and re-running still failed, reporting the exact same old commit as
 the source.

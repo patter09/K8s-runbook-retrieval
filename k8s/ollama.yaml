@@ -14,6 +14,7 @@ spec:
       labels:
         app: ollama
     spec:
+      automountServiceAccountToken: false
       containers:
         - name: ollama
           image: ollama/ollama:latest
