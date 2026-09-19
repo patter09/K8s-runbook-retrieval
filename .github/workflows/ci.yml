@@ -131,20 +131,6 @@ jobs:
           sleep 5
           ollama pull llama3.2:3b
 
-      - name: TEMP DIAGNOSTIC — find where the model actually landed
-        # Remove this step once we've confirmed the real path from an
-        # actual run. The installer sets up a systemd service under a
-        # dedicated "ollama" user, but we run `ollama serve &` manually as
-        # the runner user instead — sources disagree on which path that
-        # produces, so verify with real output rather than guess a cache
-        # path that would silently cache nothing if wrong.
-        run: |
-          echo "--- checking common candidate paths ---"
-          du -sh ~/.ollama 2>/dev/null || echo "~/.ollama : not present"
-          du -sh /usr/share/ollama/.ollama 2>/dev/null || echo "/usr/share/ollama/.ollama : not present"
-          echo "--- searching the whole filesystem for the actual blob ---"
-          find / -xdev -type d -iname "blobs" 2>/dev/null | grep -i ollama
-
       - name: Start LiteLLM gateway
         # OLLAMA_API_BASE=localhost here (not the "ollama" hostname used in
         # docker-compose.yml) because in this CI job Ollama runs as a plain
