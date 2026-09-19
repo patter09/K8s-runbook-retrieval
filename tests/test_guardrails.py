@@ -56,3 +56,14 @@ def test_redacts_card_number():
     redacted = redact_pii("charge 4111-1111-1111-1111 please")
     assert "4111-1111-1111-1111" not in redacted
     assert "[REDACTED_NUMBER]" in redacted
+
+
+def test_detects_email_with_multi_level_domain():
+    # Regression test for the EMAIL_RE restructuring (SonarCloud
+    # python:S8786 ReDoS fix): confirms the rewritten pattern still
+    # correctly handles a multi-label domain like "mail.sub.example.co.uk",
+    # not just a simple "example.com" — the exact shape most likely to
+    # break if someone "simplifies" the (?:[a-zA-Z0-9-]+\.)+ structure
+    # back into a single ambiguous character class without realizing why
+    # it's shaped this way.
+    assert "email" in contains_pii("reach the team at ops@mail.sub.example.co.uk")

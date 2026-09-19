@@ -9,7 +9,19 @@ the call sites in main.py.
 """
 import re
 
-EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+# Restructured from [a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,} (flagged
+# by SonarCloud SAST, rule python:S8786, as non-linear-backtracking risk —
+# found on a re-scan AFTER the CARD_RE fix below, a genuinely separate
+# issue in a different regex, not a stale repeat of it). The domain group
+# [a-zA-Z0-9.-]+ included literal '.' in its own character class while
+# being immediately followed by \.[a-zA-Z]{2,}, which also matches dots
+# and letters — the two constructs can consume the same characters in many
+# different ways, the classic email-regex ReDoS shape. Restructured as
+# (?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}: each repeated unit consumes exactly one
+# label plus its trailing dot, and the label's own character class no
+# longer includes '.', so there is only one way to split any given input —
+# no ambiguity left for the engine to backtrack across.
+EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}")
 PHONE_RE = re.compile(r"\b(?:\+?\d{1,3}[-.\s]?)?\(?\d{3,4}\)?[-.\s]?\d{3,4}[-.\s]?\d{3,4}\b")
 # Rewritten from \b(?:\d[ -]*?){13,16}\b (flagged by SonarCloud SAST as
 # both a super-linear/catastrophic-backtracking risk AND a reluctant
