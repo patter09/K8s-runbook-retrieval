@@ -5,6 +5,7 @@ __pycache__/
 .pytest_cache/
 app/audit.db
 *.db
+.zap-work/
 # Terraform: state and generated kubeconfig contain real credentials
 # (client certs/keys) and must never be committed, even for a throwaway
 # local cluster — this is the correct habit regardless of what the
