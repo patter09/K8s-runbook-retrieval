@@ -30,7 +30,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: https://sonarcloud.io
-          
+
   secret-scan:
     # Fastest possible check, runs first, blocks everything else — same
     # "fail fast" reasoning as guardrail-unit-tests, but for secrets
@@ -86,6 +86,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          # Built-in pip cache, keyed on requirements.txt's hash — official
+          # actions/setup-python feature, no guessing at a cache path
+          # required. Skips re-downloading torch/transformers/etc. from
+          # PyPI on every run when requirements.txt hasn't changed.
+          cache: "pip"
       - run: pip install -r requirements.txt
       - run: python -m pytest tests/ -v
 
@@ -116,6 +121,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
       - run: pip install -r requirements.txt
 
       - name: Install and start Ollama
@@ -125,7 +131,35 @@ jobs:
           sleep 5
           ollama pull llama3.2:3b
 
+      - name: TEMP DIAGNOSTIC — find where the model actually landed
+        # Remove this step once we've confirmed the real path from an
+        # actual run. The installer sets up a systemd service under a
+        # dedicated "ollama" user, but we run `ollama serve &` manually as
+        # the runner user instead — sources disagree on which path that
+        # produces, so verify with real output rather than guess a cache
+        # path that would silently cache nothing if wrong.
+        run: |
+          echo "--- checking common candidate paths ---"
+          du -sh ~/.ollama 2>/dev/null || echo "~/.ollama : not present"
+          du -sh /usr/share/ollama/.ollama 2>/dev/null || echo "/usr/share/ollama/.ollama : not present"
+          echo "--- searching the whole filesystem for the actual blob ---"
+          find / -xdev -type d -iname "blobs" 2>/dev/null | grep -i ollama
+
       - name: Start LiteLLM gateway
+        # OLLAMA_API_BASE=localhost here (not the "ollama" hostname used in
+        # docker-compose.yml) because in this CI job Ollama runs as a plain
+        # process on the runner, not as a Docker Compose service — there's
+        # no container DNS name to resolve.
+        #
+        # LITELLM_MASTER_KEY is set here from a GitHub Actions repository
+        # secret (Settings -> Secrets and variables -> Actions -> New
+        # repository secret, name: CI_LITELLM_KEY). Without it, this step
+        # was previously leaving master_key unresolved, meaning LiteLLM
+        # enforced NO authentication at all — a real gap this fix closes,
+        # found only because a later, unrelated local fix (making
+        # LITELLM_API_KEY required with no fallback in config.py) would
+        # otherwise break this job outright with a KeyError, forcing the
+        # question of what value CI should actually use.
         env:
           OLLAMA_API_BASE: http://localhost:11434
           LITELLM_MASTER_KEY: ${{ secrets.CI_LITELLM_KEY }}
