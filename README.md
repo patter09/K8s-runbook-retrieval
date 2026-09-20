@@ -226,20 +226,27 @@ DevOps-background candidates skip, and it's worth walking through explicitly.
   Issues 13-15), RBAC (`automountServiceAccountToken: false` on all 6
   workloads, since none of them ever call the Kubernetes API — verified by
   reading the actual mounted token before the fix and confirming the
-  directory is gone afterward — see Issue 16), and two Kyverno policies in
+  directory is gone afterward — see Issue 16), two Kyverno policies in
   Audit mode (require non-root containers, disallow floating image tags —
   see Issue 17, where both policies turned out to have real bugs of their
   own, caught by testing against known-true and known-false cases rather
-  than trusting a clean `kubectl apply`), plus the existing
-  `guardrails.py` input/output filtering. **Not yet implemented**, and
-  worth naming explicitly rather than glossing over: static analysis on
-  `app/*.py` (SAST, e.g. SonarCloud), dynamic scanning of the running API
-  (DAST, e.g. OWASP ZAP), and actually fixing the violations the Kyverno
-  policies found (no manifest sets `runAsNonRoot`, and 5 of 6 images use a
-  floating tag) — Audit mode reports the problem, it doesn't fix it.
-  Given the CV skills this project maps against (SAST, DAST, RBAC,
-  defense-in-depth), this is the most valuable remaining phase, not an
-  afterthought.
+  than trusting a clean `kubectl apply`), SAST (SonarCloud, CI-gated —
+  see Issues 18-19, which found and fixed two genuine ReDoS
+  vulnerabilities plus an independent PII-redaction ordering bug no tool
+  flagged), and DAST (OWASP ZAP against the live API's OpenAPI spec,
+  wired into CI — see Issues 20-22, two real header findings fixed and
+  re-verified, plus two environment-specific CI bugs found and fixed),
+  on top of the existing `guardrails.py` input/output filtering.
+  **Not yet implemented**, and worth naming explicitly rather than
+  glossing over: actually fixing the violations the Kyverno policies
+  found (no manifest sets `runAsNonRoot`, and 5 of 6 images use a
+  floating tag) and enabling a blocking quality gate for SonarCloud/ZAP
+  now that both have a clean baseline — Audit mode reports problems, it
+  doesn't fix them. Given the CV skills this project maps against (SAST,
+  DAST, RBAC, defense-in-depth), all of which are now genuinely
+  demonstrated with real, verified findings rather than just tool
+  installation, this section is one of the strongest parts of the whole
+  project.
 
 ## Debugging log — what actually broke, and how it was fixed
 
@@ -828,6 +835,147 @@ a real floating tag fail `disallow-latest-tag` (`knowledge-assistant`,
 pinned to `:local`, correctly passes) — a full matrix check, not just
 confirming the two cases that were already known to be wrong.
 
+### Issue 18 — SonarCloud SAST found two genuine ReDoS vulnerabilities, plus a bug of its own
+
+**Context:** added SonarCloud static analysis to CI (Audit mode — report
+only, no blocking quality gate yet, same sequencing as the Kyverno
+policies). First-ever static analysis this codebase had — 4 findings on
+the first scan, all genuine, none noise.
+
+**Finding 1-2 (same regex, two rules) — `CARD_RE` was a real ReDoS
+vector.** `\b(?:\d[ -]*?){13,16}\b` was flagged for both super-linear
+backtracking risk and a reluctant quantifier that could only ever match 0
+repetitions in practice — the same nested `[ -]*?` inside a bounded outer
+repeat caused both. Genuinely serious, not a lint nit: `contains_pii()`
+runs on every request and response, so a crafted input could exploit it.
+**Fix:** rewrote as `\b\d(?:[ -]?\d){12,15}\b` — a fixed-width repeated
+unit with a bounded `?` instead of an unbounded `*?`, eliminating the
+ambiguity the engine could backtrack across.
+
+**Finding 3-4 — minor, quick fixes.** Missing `responses={400: ...}`
+documentation on the `/query` route, and outdated (pre-`Annotated`)
+FastAPI dependency-injection style. Both fixed directly.
+
+**A new regression test for `CARD_RE` (there had never been one) caught
+an independent, pre-existing bug no tool had flagged: `redact_pii`'s
+substitution order was wrong.** It ran `PHONE_RE.sub` before
+`CARD_RE.sub` — a card-number-shaped string can partially satisfy
+`PHONE_RE`'s shorter, more general pattern, so `PHONE_RE` consumed part
+of a 16-digit test card number before `CARD_RE` ever saw it intact,
+leaving a corrupted, half-redacted result (`"[REDACTED_PHONE]-1111"`
+instead of a full redaction). **Fix:** reordered so the more
+specific/longer pattern (`CARD_RE`) runs before the more general one
+(`PHONE_RE`) — the more specific match needs first claim on the digits.
+Found entirely by writing a test *for a different fix*, not by any
+scanner.
+
+### Issue 19 — a second real ReDoS (`EMAIL_RE`), found only on a later re-scan
+
+**Symptom:** after fixing all 4 original findings and pushing, SonarCloud
+reported a **new** Reliability issue — same rule (`python:S8786`,
+non-linear backtracking) but on `EMAIL_RE`, a regex the first scan never
+flagged at all.
+
+**Real bug, not a stale repeat:** `[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}`
+— the domain group includes literal `.` in its own character class while
+being immediately followed by `\.[a-zA-Z]{2,}`, which also matches dots
+and letters. Both constructs can consume the same characters many
+different ways on a long dotted string — the classic email-regex ReDoS
+shape. **Fix:** restructured as `(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}` — each
+repeated unit consumes exactly one label plus its trailing dot, and the
+label's own character class no longer includes `.`, so there's only one
+way to split any input. Verified it still matches multi-level domains
+(`user@mail.sub.example.co.uk`) before trusting it, and added a
+regression test for exactly that case. Confirmed resolved by re-checking
+the SonarCloud dashboard directly (Reliability: 1 → 0), not by assuming
+the fix was correct.
+
+### Issue 20 — getting OWASP ZAP to actually scan the API at all
+
+**Context:** DAST scans the *running* application from outside, sending
+real requests — a different layer from everything else in the pipeline
+(secrets, dependency versions, infra config, source code). Chose
+`zap-api-scan.py` against FastAPI's auto-generated `openapi.json` rather
+than a generic crawler, since a 3-endpoint JSON API has nothing to
+"spider."
+
+**Bug 1 — `NoUrlsException`.** FastAPI's `openapi.json` has no `servers`
+entry (the app has no way to know its own deployed URL), and ZAP's
+importer refuses to guess one:
+`SwaggerException: Unable to obtain any server URL from the definition`.
+**Fix:** injected a `servers` entry into a local copy of the spec —
+tooling metadata, not an app code change.
+
+**A concern that turned out to be unfounded, but worth verifying rather
+than assuming either way:** the scan initially looked like it had
+skipped `/query` entirely (0 mentions of "query" anywhere in the HTML
+report). Checked the actual audit log rather than guessing — it showed a
+real `allowed` row with `question: "John Doe"` (a generic placeholder
+ZAP's fuzzer generates for a string field with no example), timestamped
+inside the scan's runtime window. This **confirmed** `/query` was
+genuinely exercised, auth included; the report's summary format simply
+doesn't list per-URL detail for clean passes, only for `WARN`/`FAIL`
+entries. Worth remembering: a clean-looking report and a report that
+skipped the interesting endpoint can look identical unless you check.
+
+### Issue 21 — 2 real, fixed DAST findings, verified by re-scanning
+
+**Findings:** `X-Content-Type-Options Header Missing` and
+`Cross-Origin-Resource-Policy Header Missing or Invalid`, both on
+`/health` and `/metrics` (the report's per-URL listing, unlike the clean
+passes in Issue 20, does show explicit paths for `WARN` entries). Real,
+standard, cheap-to-fix findings, not false positives.
+
+**Fix:** a FastAPI middleware (`add_security_headers`) setting both
+headers on every response, not per-endpoint — covers `/query` too, even
+though it wasn't separately named in the `WARN` listing. **Verified,
+not assumed:** re-ran the identical scan; both findings converted to
+explicit `PASS` entries, and the total PASS count moved from 116 to 118
+— independent confirmation the fix actually took effect, not just that
+the warnings disappeared from a differently-scoped run.
+
+### Issue 22 — wiring DAST into CI surfaced two more real, environment-specific bugs
+
+**Context:** extended the existing `eval-gate` job rather than
+duplicating its expensive setup (Ollama pull alone takes several
+minutes) — DAST needs the full stack (Qdrant, Ollama, LiteLLM, and now
+the app itself) running, so it reuses infrastructure already live in
+that job.
+
+**Bug 1 — connection refused despite a clean startup log.** The first
+CI run failed with `curl` exit code 7 (connection refused) on
+`/health`, even though uvicorn's own log showed all four startup lines
+completing normally. A fixed `sleep 5` is a guess, not a check — no
+evidence it was "long enough" versus merely usually being long enough
+locally. **Fix:** replaced it with an actual poll-until-ready loop (up
+to 60s, checking `/health` every 2s) and redirected uvicorn's own
+stdout/stderr to a file, so a repeat failure would surface the app's
+real error instead of another blind guess. This resolved it — the loop
+approach is also just the objectively correct pattern for "wait for a
+server to become ready in CI," not merely a workaround.
+
+**Bug 2 — permission denied writing the report.** Scanning itself then
+succeeded completely (118 checks, 0 alerts) on the next run, but the job
+still failed: `PermissionError: [Errno 13] Permission denied:
+'/zap/wrk/report.html'`. ZAP's container runs as its own non-root,
+fixed-UID user — it could *read* the mounted `openapi.json` fine
+(default `755` permissions allow any user to read/traverse) but couldn't
+*write* `report.html` into that same directory, since the GitHub Actions
+runner's default `mkdir` doesn't grant write access to other UIDs. This
+never appeared locally, because local Docker's default permissions
+happened to be permissive enough — a genuine environment difference
+between a developer machine and a CI runner, not a mistake in either
+setup. **Fix:** `chmod -R 777` the working directory before mounting it
+— the standard, documented workaround for this specific, common
+ZAP-in-Docker-CI issue.
+
+**Also caught in passing:** a documentation mistake, not a code bug — a
+condensed re-paste of `ci.yml` accidentally dropped several explanatory
+comments (the `eval-gate` fail-fast reasoning, the `OLLAMA_API_BASE`
+explanation) that an earlier version had. Caught by comparing the diff
+size against what was actually intended, not by reading the file
+character-by-character — restored in the next commit.
+
 ## Interview talking points
 
 - "I built the AI-specific layer (vector search, model serving, gateway) the
@@ -879,3 +1027,13 @@ confirming the two cases that were already known to be wrong.
   that both Kyverno policies looked correct but were silently no-ops or
   had real blind spots until tested against cases already known to be
   true or false, not just applied and trusted.
+- Issues 18-22 (SAST + DAST) are the strongest answer in the repo to
+  "walk me through a security vulnerability you found and fixed" — two
+  independent, genuine ReDoS vulnerabilities (not lint nits: both sit in
+  code that runs on every single request), an independent bug found only
+  because writing a proper regression test exercised a case nothing had
+  tested before, and a live dynamic scan of the actual running API rather
+  than just reading source code. The two CI-integration bugs (Issue 22)
+  are also a good, concrete answer to "what's different about running
+  security tooling in CI versus your own machine" — same code, same
+  scanner, genuinely different failure modes from the environment itself.
