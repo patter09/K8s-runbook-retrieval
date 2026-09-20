@@ -61,12 +61,6 @@ jobs:
       - name: Determine commit range for this push
         id: range
         run: |
-          # github.event.before is unset on pull_request events and is all
-          # zeros on the very first push to a new branch — both fall back
-          # to scanning just the latest commit rather than failing outright.
-          # This fallback is a deliberate simplification for a multi-commit
-          # PR (it won't scan every commit in the PR individually), noted
-          # here rather than hidden.
           if [ -z "${{ github.event.before }}" ] || [ "${{ github.event.before }}" = "0000000000000000000000000000000000000000" ]; then
             echo "opts=--log-opts=-1" >> "$GITHUB_OUTPUT"
           else
@@ -79,37 +73,18 @@ jobs:
         run: gitleaks detect --source . --config .gitleaks-custom.toml ${{ steps.range.outputs.opts }} --baseline-path .gitleaks-baseline.json --verbose
 
   guardrail-unit-tests:
-    # Fast, deterministic checks — no LLM/model dependency, runs on every push.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          # Built-in pip cache, keyed on requirements.txt's hash — official
-          # actions/setup-python feature, no guessing at a cache path
-          # required. Skips re-downloading torch/transformers/etc. from
-          # PyPI on every run when requirements.txt hasn't changed.
           cache: "pip"
       - run: pip install -r requirements.txt
       - run: python -m pytest tests/ -v
 
   eval-gate:
-    # Depends on BOTH fast checks passing first — no point spending 5-10
-    # minutes pulling a model and running eval if a cheap, fast check
-    # already caught a regression (secret leak or code bug). "Fail fast"
-    # ordering, now covering security as well as correctness.
     needs: [guardrail-unit-tests, secret-scan]
-    # Full RAG pipeline eval: spins up Qdrant + Ollama, ingests the sample
-    # docs, and runs eval/run_eval.py as a merge gate.
-    #
-    # NOTE (talking point for the interview): pulling and running an LLM in
-    # a GitHub-hosted runner is slow and resource-constrained. A real
-    # deployment points this job at a shared, already-warm model endpoint
-    # (the same LiteLLM gateway the app uses in production) instead of
-    # spinning up a fresh model per CI run. This job is kept here to show
-    # the *pattern* end-to-end; production would swap the local Ollama
-    # service below for the shared platform endpoint.
     runs-on: ubuntu-latest
     services:
       qdrant:
@@ -132,20 +107,6 @@ jobs:
           ollama pull llama3.2:3b
 
       - name: Start LiteLLM gateway
-        # OLLAMA_API_BASE=localhost here (not the "ollama" hostname used in
-        # docker-compose.yml) because in this CI job Ollama runs as a plain
-        # process on the runner, not as a Docker Compose service — there's
-        # no container DNS name to resolve.
-        #
-        # LITELLM_MASTER_KEY is set here from a GitHub Actions repository
-        # secret (Settings -> Secrets and variables -> Actions -> New
-        # repository secret, name: CI_LITELLM_KEY). Without it, this step
-        # was previously leaving master_key unresolved, meaning LiteLLM
-        # enforced NO authentication at all — a real gap this fix closes,
-        # found only because a later, unrelated local fix (making
-        # LITELLM_API_KEY required with no fallback in config.py) would
-        # otherwise break this job outright with a KeyError, forcing the
-        # question of what value CI should actually use.
         env:
           OLLAMA_API_BASE: http://localhost:11434
           LITELLM_MASTER_KEY: ${{ secrets.CI_LITELLM_KEY }}
@@ -167,26 +128,31 @@ jobs:
         run: python eval/run_eval.py --threshold 0.75
 
       - name: Start the app itself for DAST scanning
-        # Reuses the Qdrant/Ollama/LiteLLM stack already running above
-        # instead of standing up a second, duplicate job — a full
-        # eval-gate-style setup is expensive (Ollama pull alone takes
-        # several minutes), so DAST piggybacks on infrastructure that's
-        # already live rather than paying that cost twice per push.
+        # A fixed `sleep 5` here first attempt failed with curl exit code
+        # 7 (connection refused) despite uvicorn's own log showing a full,
+        # clean startup. Replaced with an actual poll-until-ready loop
+        # (up to 60s) and captured uvicorn's own stdout/stderr to a file,
+        # so a repeat failure surfaces the app's real error instead of
+        # another blind guess.
         env:
           LITELLM_API_KEY: ${{ secrets.CI_LITELLM_KEY }}
           APP_API_KEY: ${{ secrets.CI_APP_KEY }}
         run: |
           cd app
-          uvicorn main:app --host 0.0.0.0 --port 8000 &
-          sleep 5
-          curl -sf http://localhost:8000/health
+          uvicorn main:app --host 0.0.0.0 --port 8000 > /tmp/uvicorn.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8000/health > /dev/null; then
+              echo "App is up after $((i * 2))s"
+              exit 0
+            fi
+            echo "Waiting for app to start... (attempt $i/30)"
+            sleep 2
+          done
+          echo "App failed to become ready after 60s — full uvicorn log:"
+          cat /tmp/uvicorn.log
+          exit 1
 
       - name: Prepare OpenAPI spec for ZAP
-        # FastAPI's auto-generated openapi.json has no "servers" entry (it
-        # has no way to know its own deployed URL), and ZAP's importer
-        # refuses to guess one — confirmed directly in local testing
-        # (SwaggerException: "Unable to obtain any server URL from the
-        # definition"). Inject it into a local copy rather than the app.
         run: |
           mkdir -p zap-wrk
           curl -s http://localhost:8000/openapi.json -o zap-wrk/openapi.json
@@ -200,14 +166,6 @@ jobs:
           "
 
       - name: DAST scan with OWASP ZAP
-        # -I: don't fail the build on WARN-level findings — same
-        # "Audit before Enforce" sequencing used for the Kyverno policies
-        # and the SonarCloud quality gate. FAIL-level findings (the
-        # serious rule matches: SQLi, RCE, etc.) still fail this step.
-        # First time this job runs a container directly with `docker run`
-        # rather than GitHub's own `services:` block (used for Qdrant
-        # above) — ubuntu-latest ships Docker usable without sudo, so this
-        # should work as-is, but it's genuinely unverified until it runs.
         env:
           APP_API_KEY: ${{ secrets.CI_APP_KEY }}
         run: |
