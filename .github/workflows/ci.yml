@@ -216,6 +216,19 @@ jobs:
           with open('zap-wrk/openapi.json', 'w') as f:
               json.dump(spec, f)
           "
+          # ZAP's container runs as its own non-root, fixed-UID user. It
+          # could READ openapi.json fine (default 755 permissions allow
+          # any user to read/traverse), but failed to WRITE report.html
+          # into this same mounted directory — confirmed directly:
+          # "PermissionError: [Errno 13] Permission denied:
+          # '/zap/wrk/report.html'" on the first real CI run, even though
+          # the scan itself completed cleanly (118 checks, 0 alerts).
+          # This didn't appear in local testing because local Docker
+          # defaults happened to be permissive enough — a genuine
+          # environment difference, not something either setup did wrong.
+          # chmod 777 is the standard, documented workaround for this
+          # exact class of ZAP-in-CI issue.
+          chmod -R 777 zap-wrk
 
       - name: DAST scan with OWASP ZAP
         # -I: don't fail the build on WARN-level findings — same
