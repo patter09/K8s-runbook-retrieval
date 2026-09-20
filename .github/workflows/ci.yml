@@ -165,3 +165,65 @@ jobs:
           LITELLM_API_KEY: ${{ secrets.CI_LITELLM_KEY }}
           APP_API_KEY: ${{ secrets.CI_APP_KEY }}
         run: python eval/run_eval.py --threshold 0.75
+
+      - name: Start the app itself for DAST scanning
+        # Reuses the Qdrant/Ollama/LiteLLM stack already running above
+        # instead of standing up a second, duplicate job — a full
+        # eval-gate-style setup is expensive (Ollama pull alone takes
+        # several minutes), so DAST piggybacks on infrastructure that's
+        # already live rather than paying that cost twice per push.
+        env:
+          LITELLM_API_KEY: ${{ secrets.CI_LITELLM_KEY }}
+          APP_API_KEY: ${{ secrets.CI_APP_KEY }}
+        run: |
+          cd app
+          uvicorn main:app --host 0.0.0.0 --port 8000 &
+          sleep 5
+          curl -sf http://localhost:8000/health
+
+      - name: Prepare OpenAPI spec for ZAP
+        # FastAPI's auto-generated openapi.json has no "servers" entry (it
+        # has no way to know its own deployed URL), and ZAP's importer
+        # refuses to guess one — confirmed directly in local testing
+        # (SwaggerException: "Unable to obtain any server URL from the
+        # definition"). Inject it into a local copy rather than the app.
+        run: |
+          mkdir -p zap-wrk
+          curl -s http://localhost:8000/openapi.json -o zap-wrk/openapi.json
+          python3 -c "
+          import json
+          with open('zap-wrk/openapi.json') as f:
+              spec = json.load(f)
+          spec['servers'] = [{'url': 'http://localhost:8000'}]
+          with open('zap-wrk/openapi.json', 'w') as f:
+              json.dump(spec, f)
+          "
+
+      - name: DAST scan with OWASP ZAP
+        # -I: don't fail the build on WARN-level findings — same
+        # "Audit before Enforce" sequencing used for the Kyverno policies
+        # and the SonarCloud quality gate. FAIL-level findings (the
+        # serious rule matches: SQLi, RCE, etc.) still fail this step.
+        # First time this job runs a container directly with `docker run`
+        # rather than GitHub's own `services:` block (used for Qdrant
+        # above) — ubuntu-latest ships Docker usable without sudo, so this
+        # should work as-is, but it's genuinely unverified until it runs.
+        env:
+          APP_API_KEY: ${{ secrets.CI_APP_KEY }}
+        run: |
+          docker run --rm --network="host" \
+            -v $(pwd)/zap-wrk:/zap/wrk/:rw \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-api-scan.py \
+            -t /zap/wrk/openapi.json \
+            -f openapi \
+            -I \
+            -z "-config replacer.full_list(0).description=auth -config replacer.full_list(0).enabled=true -config replacer.full_list(0).matchtype=REQ_HEADER -config replacer.full_list(0).matchstr=X-API-Key -config replacer.full_list(0).regex=false -config replacer.full_list(0).replacement=$APP_API_KEY" \
+            -r report.html
+
+      - name: Upload ZAP report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-dast-report
+          path: zap-wrk/report.html
